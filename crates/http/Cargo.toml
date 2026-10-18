@@ -10,6 +10,7 @@ name = "chronos-http"
 path = "src/main.rs"
 
 [dependencies]
+chronos-core = { path = "../core" }
 axum = "0.8"
 tokio.workspace = true
 serde.workspace = true
