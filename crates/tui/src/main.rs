@@ -1,31 +1,19 @@
 // =============================================================================
-// spark-deck — TUI cluster-control / telemetry dashboard for a 2-node
-// NVIDIA DGX Spark (GB10) cluster (head: `ai`, worker: `ai2`).
+// chronos-tui — ratatui frontend for the 2-node NVIDIA DGX Spark (GB10)
+// cluster (head: `ai`, worker: `ai2`).
 //
-// Single-file ratatui app. Background collectors poll HTTP endpoints (2s) and
-// system/SSH probes (3s), publishing snapshots through a tokio::sync::watch
-// channel to the render loop. `--dump-state` runs one full pass and prints the
-// JSON state (verification path).
-//
-// Sections:
-//   1. constants / paths
-//   2. data model (registry + JSON snapshots)
-//   3. registry load/seed/save
-//   4. small parsing helpers
-//   5. collectors (storage, nodes, GPU attribution, HTTP probes)
-//   6. shared state + publishers
-//   7. lifecycle actions (start/stop/add/remove/drop-caches/logs)
-//   8. TUI (ui state, drawing, key handling)
-//   9. main
+// Thin consumer of chronos-core: background collectors, registry, engine
+// probes and lifecycle actions all live in the core crate and publish
+// snapshots through a tokio::sync::watch channel. This file keeps only:
+//   1. TUI state (selection, modal, confirm, log drawer)
+//   2. drawing
+//   3. key handling
+//   4. action dispatch -> core
+//   5. main (+ --dump-state via core::run_dump_state)
 // =============================================================================
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::Path;
 use std::time::{Duration, Instant};
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -40,1379 +28,14 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+
+use chronos_core::{
+    compact, gib, Collector, RegistryEntry, AI2_LAN, AI_LAN,
+};
 
 // =============================================================================
-// 1. CONSTANTS / PATHS
-// =============================================================================
-
-const AI2_LAN: &str = "192.168.20.229";
-const AI_LAN: &str = "192.168.20.63";
-const HTTP_TIMEOUT_MS: u64 = 1500;
-const HTTP_INTERVAL_SECS: u64 = 2;
-const SYS_INTERVAL_SECS: u64 = 3;
-const CHECK_TIMEOUT_SECS: u64 = 2; // per storage/system check
-const SSH_BLOB_TIMEOUT_SECS: u64 = 6; // one combined ssh batch for ai2
-const STARTING_GRACE_SECS: u64 = 300; // STARTING until endpoint answers (or this expires)
-
-/// Base dir for data + logs. On the head node this is /home/sean/spark-deck;
-/// fall back to cwd (e.g. when type-checking/running locally on a Mac).
-fn base_dir() -> PathBuf {
-    let p = PathBuf::from("/home/sean/spark-deck");
-    if p.is_dir() {
-        p
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    }
-}
-
-fn logs_dir() -> PathBuf {
-    base_dir().join("logs")
-}
-
-fn registry_path() -> PathBuf {
-    base_dir().join("data").join("registry.json")
-}
-
-fn log_file_for(id: &str) -> PathBuf {
-    logs_dir().join(format!("{}.log", sanitize_id(id)))
-}
-
-fn sanitize_id(id: &str) -> String {
-    id.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
-        .collect()
-}
-
-fn is_ai2_host(host: &str) -> bool {
-    host == AI2_LAN || host == "ai2"
-}
-
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_millis(HTTP_TIMEOUT_MS))
-        .build()
-        .expect("failed to build reqwest client")
-}
-
-// =============================================================================
-// 2. DATA MODEL
-// =============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegistryEntry {
-    id: String,
-    path: String,
-    #[serde(default)]
-    start: String,
-    #[serde(default)]
-    stop: String,
-    host: String,
-    port: u16,
-    #[serde(default)]
-    slot: String,
-    #[serde(default = "default_engine")]
-    engine: String,
-    #[serde(default)]
-    containers: Vec<String>,
-    #[serde(default)]
-    process_match: Option<String>,
-}
-
-fn default_engine() -> String {
-    "vllm".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-struct StorageChecks {
-    ai_findmnt: bool,
-    ai_mdstat: bool,
-    ai_stat: bool,
-    ai2_findmnt: bool,
-    ai2_stat: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-struct StorageState {
-    online: bool,
-    fstype: Option<String>,
-    reason: Option<String>,
-    total_bytes: Option<u64>,
-    used_bytes: Option<u64>,
-    avail_bytes: Option<u64>,
-    checks: StorageChecks,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-struct DiskInfo {
-    total_bytes: u64,
-    used_bytes: u64,
-    avail_bytes: u64,
-    use_pct: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-struct NodeState {
-    mem_total_bytes: Option<u64>,
-    mem_available_bytes: Option<u64>,
-    mem_used_bytes: Option<u64>,
-    mem_cache_bytes: Option<u64>,
-    swap_total_bytes: Option<u64>,
-    swap_used_bytes: Option<u64>,
-    disk_root: Option<DiskInfo>,
-}
-
-/// One entry in the published JSON state (shape fixed by spec).
-#[derive(Debug, Clone, Serialize)]
-struct EntrySnapshot {
-    id: String,
-    path: String,
-    slot: String,
-    engine: String,
-    host: String,
-    port: u16,
-    state: String,
-    containers: Vec<String>,
-    served_model: Option<String>,
-    status_detail: Option<String>,
-    mem_ai_bytes: u64,
-    mem_ai2_bytes: u64,
-    mem_total_bytes: u64,
-    concurrent_requests: Option<u64>,
-    queued_requests: Option<u64>,
-    live_tok_per_sec: Option<f64>,
-    lifetime_decode_tok_per_sec: Option<f64>,
-    total_tokens_generated: Option<u64>,
-    prompt_tokens_total: Option<u64>,
-    cached_tokens_total: Option<u64>,
-}
-
-/// Top-level JSON document (also the TUI snapshot).
-#[derive(Debug, Clone, Serialize, Default)]
-struct AppState {
-    timestamp: String,
-    storage: StorageState,
-    nodes: BTreeMap<String, Option<NodeState>>,
-    entries: Vec<EntrySnapshot>,
-}
-
-/// Rolling counters kept between polls to compute deltas.
-#[derive(Debug, Clone, Default)]
-struct Prev {
-    total: Option<u64>,
-    decode_s: Option<f64>,
-    at: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ProbeResult {
-    ok: bool,
-    detail: Option<String>,
-    served_model: Option<String>,
-    concurrent: Option<u64>,
-    queued: Option<u64>,
-    live_tok_per_sec: Option<f64>,
-    lifetime_decode: Option<f64>,
-    total_tokens: Option<u64>,
-    prompt_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum GraceKind {
-    Starting,
-    Stopping,
-}
-
-/// Mutable state shared between collectors, actions and the TUI.
-struct Shared {
-    tx: watch::Sender<Arc<AppState>>,
-    registry: RwLock<Vec<RegistryEntry>>,
-    storage: RwLock<StorageState>,
-    nodes: RwLock<BTreeMap<String, Option<NodeState>>>,
-    /// id -> (mem_ai_bytes, mem_ai2_bytes)
-    mem: RwLock<HashMap<String, (u64, u64)>>,
-    probes: RwLock<HashMap<String, ProbeResult>>,
-    states: RwLock<HashMap<String, String>>,
-    grace: Mutex<HashMap<String, (GraceKind, Instant)>>,
-}
-
-impl Shared {
-    fn publish(&self) {
-        let registry = self.registry.read().unwrap().clone();
-        let storage = self.storage.read().unwrap().clone();
-        let nodes = self.nodes.read().unwrap().clone();
-        let mem = self.mem.read().unwrap().clone();
-        let probes = self.probes.read().unwrap().clone();
-        let states = self.states.read().unwrap().clone();
-        let app = assemble(&registry, &storage, &nodes, &mem, &probes, &states);
-        let _ = self.tx.send(Arc::new(app));
-    }
-}
-
-fn assemble(
-    registry: &[RegistryEntry],
-    storage: &StorageState,
-    nodes: &BTreeMap<String, Option<NodeState>>,
-    mem: &HashMap<String, (u64, u64)>,
-    probes: &HashMap<String, ProbeResult>,
-    states: &HashMap<String, String>,
-) -> AppState {
-    let mut entries = Vec::new();
-    for e in registry {
-        let (m_ai, m_ai2) = mem.get(&e.id).copied().unwrap_or((0, 0));
-        let p = probes.get(&e.id);
-        let state = states
-            .get(&e.id)
-            .cloned()
-            .unwrap_or_else(|| "STOPPED".to_string());
-        entries.push(EntrySnapshot {
-            id: e.id.clone(),
-            path: e.path.clone(),
-            slot: e.slot.clone(),
-            engine: e.engine.clone(),
-            host: e.host.clone(),
-            port: e.port,
-            state,
-            containers: e.containers.clone(),
-            served_model: p.and_then(|x| x.served_model.clone()),
-            status_detail: p.and_then(|x| x.detail.clone()),
-            mem_ai_bytes: m_ai,
-            mem_ai2_bytes: m_ai2,
-            mem_total_bytes: m_ai + m_ai2,
-            concurrent_requests: p.and_then(|x| x.concurrent),
-            queued_requests: p.and_then(|x| x.queued),
-            live_tok_per_sec: p.and_then(|x| x.live_tok_per_sec),
-            lifetime_decode_tok_per_sec: p.and_then(|x| x.lifetime_decode),
-            total_tokens_generated: p.and_then(|x| x.total_tokens),
-            prompt_tokens_total: p.and_then(|x| x.prompt_tokens),
-            cached_tokens_total: p.and_then(|x| x.cached_tokens),
-        });
-    }
-    AppState {
-        timestamp: chrono::Utc::now().to_rfc3339(),
-        storage: storage.clone(),
-        nodes: nodes.clone(),
-        entries,
-    }
-}
-
-// =============================================================================
-// 3. REGISTRY LOAD / SEED / SAVE
-// =============================================================================
-
-fn seed_registry() -> Vec<RegistryEntry> {
-    vec![
-        RegistryEntry {
-            id: "glm53-tensorfold-spark".into(),
-            path: "/home/sean/repos/glm53-tensorfold-spark".into(),
-            start: "./launch.sh start".into(),
-            stop: "./launch.sh stop".into(),
-            host: AI_LAN.into(),
-            port: 8888,
-            slot: "primary-llm".into(),
-            engine: "tensorfold".into(),
-            containers: vec!["glm53-tf-r0".into(), "glm53-tf-r1".into()],
-            process_match: None,
-        },
-        RegistryEntry {
-            id: "DeepSeek-v4.1-Flash-2x-DGX-Spark".into(),
-            path: "/home/sean/repos/DeepSeek-v4.1-Flash-2x-DGX-Spark".into(),
-            start: "./start-server.sh".into(),
-            stop: "./stop-server.sh".into(),
-            host: AI_LAN.into(),
-            port: 8888,
-            slot: "primary-llm".into(),
-            engine: "vllm".into(),
-            containers: vec![],
-            process_match: None,
-        },
-        RegistryEntry {
-            id: "veloGB10 (Qwen3.8-Flash-Next)".into(),
-            path: "/home/sean/repos/veloGB10".into(),
-            start: "./launch_qwen38_flash_next.sh 2".into(),
-            stop: "pkill -f gb10_inference || true; ssh -o BatchMode=yes ai2 'pkill -f gb10_inference || true'".into(),
-            host: AI_LAN.into(),
-            port: 8888,
-            slot: "primary-llm".into(),
-            engine: "velogb10".into(),
-            containers: vec![],
-            process_match: Some("gb10_inference".into()),
-        },
-        RegistryEntry {
-            id: "launch-embedding-ai.sh (BGE-M3)".into(),
-            path: "/mnt/nvmeof/launchers".into(),
-            start: "./launch-embedding-ai.sh".into(),
-            stop: "docker rm -f vllm_bge_m3".into(),
-            host: AI_LAN.into(),
-            port: 8891,
-            slot: "aux-embedding".into(),
-            engine: "vllm".into(),
-            containers: vec!["vllm_bge_m3".into()],
-            process_match: None,
-        },
-        RegistryEntry {
-            id: "launch-reranker-ai2.sh (BGE-Reranker-v2-M3)".into(),
-            path: "/mnt/nvmeof/launchers".into(),
-            start: "./launch-reranker-ai2.sh".into(),
-            stop: "ssh -o BatchMode=yes ai2 'docker rm -f vllm_bge_reranker'".into(),
-            host: AI2_LAN.into(),
-            port: 8892,
-            slot: "aux-reranker".into(),
-            engine: "vllm".into(),
-            containers: vec!["vllm_bge_reranker".into()],
-            process_match: None,
-        },
-    ]
-}
-
-fn load_registry() -> Vec<RegistryEntry> {
-    let p = registry_path();
-    if let Ok(s) = std::fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<Vec<RegistryEntry>>(&s) {
-            return v;
-        }
-    }
-    let seeded = seed_registry();
-    let _ = save_registry(&seeded);
-    seeded
-}
-
-fn save_registry(entries: &[RegistryEntry]) -> Result<(), String> {
-    let p = registry_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
-    }
-    let s = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
-    std::fs::write(&p, s).map_err(|e| format!("write {}: {e}", p.display()))
-}
-
-// =============================================================================
-// 4. SMALL PARSING / FORMATTING HELPERS
-// =============================================================================
-
-/// df -B1 <path> -> (total, used, avail, use_pct)
-fn parse_df(output: &str) -> Option<(u64, u64, u64, f64)> {
-    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() < 2 {
-        return None;
-    }
-    let f: Vec<&str> = lines[1].split_whitespace().collect();
-    if f.len() < 5 {
-        return None;
-    }
-    let total = f[1].parse().ok()?;
-    let used = f[2].parse().ok()?;
-    let avail = f[3].parse().ok()?;
-    let pct = f[4].trim_end_matches('%').parse::<f64>().ok()?;
-    Some((total, used, avail, pct))
-}
-
-fn meminfo_key(s: &str, key: &str) -> Option<u64> {
-    s.lines()
-        .find(|l| l.starts_with(key))?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()
-}
-
-/// /proc/meminfo -> (total_kb, avail_kb, cache_kb, swap_total_kb, swap_used_kb)
-fn parse_meminfo(s: &str) -> Option<(u64, u64, u64, u64, u64)> {
-    let total = meminfo_key(s, "MemTotal:")?;
-    let avail = meminfo_key(s, "MemAvailable:").unwrap_or_else(|| meminfo_key(s, "MemFree:").unwrap_or(0));
-    let buffers = meminfo_key(s, "Buffers:").unwrap_or(0);
-    let cached = meminfo_key(s, "Cached:").unwrap_or(0);
-    let st = meminfo_key(s, "SwapTotal:").unwrap_or(0);
-    let sf = meminfo_key(s, "SwapFree:").unwrap_or(0);
-    Some((total, avail, buffers + cached, st, st.saturating_sub(sf)))
-}
-
-/// nvidia-smi csv "pid, mib" -> (pid, bytes)
-fn parse_gpu_apps(s: &str) -> Vec<(u32, u64)> {
-    s.lines()
-        .filter_map(|l| {
-            let mut it = l.split(',');
-            let pid: u32 = it.next()?.trim().parse().ok()?;
-            let mib: u64 = it.next()?.trim().parse().ok()?;
-            Some((pid, mib.saturating_mul(1_048_576)))
-        })
-        .collect()
-}
-
-/// docker ps --format '{{.ID}}|{{.Names}}' -> {id -> name}
-fn parse_docker_ps(s: &str) -> HashMap<String, String> {
-    s.lines()
-        .filter_map(|l| {
-            let (id, name) = l.split_once('|')?;
-            if id.trim().len() >= 12 {
-                Some((id.trim().to_string(), name.trim().to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
-}
-
-fn compact(n: u64) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.2}B", n as f64 / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.2}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
-}
-
-fn jnum(v: &Value, key: &str) -> Option<u64> {
-    v.get(key).and_then(|x| x.as_f64()).map(|f| f as u64)
-}
-
-fn jf(v: &Value, key: &str) -> Option<f64> {
-    v.get(key).and_then(|x| x.as_f64())
-}
-
-/// Split a marker-delimited blob ("===NAME===") into sections.
-fn sections(s: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    let mut name = String::new();
-    let mut cur = String::new();
-    for line in s.lines() {
-        if line.starts_with("===") && line.ends_with("===") {
-            if !name.is_empty() {
-                map.insert(name.clone(), cur.clone());
-            }
-            name = line.trim_matches('=').to_string();
-            cur.clear();
-        } else {
-            cur.push_str(line);
-            cur.push('\n');
-        }
-    }
-    if !name.is_empty() {
-        map.insert(name, cur);
-    }
-    map
-}
-
-#[derive(Debug, Clone, Default)]
-struct ProcInfo {
-    pid: u32,
-    rss_bytes: u64,
-    container_hex: Option<String>,
-    cmdline: String,
-}
-
-// =============================================================================
-// 5. COLLECTORS
-// =============================================================================
-
-async fn run_cmd(program: &str, args: &[&str]) -> Option<String> {
-    match tokio::process::Command::new(program).args(args).output().await {
-        Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).to_string()),
-        _ => None,
-    }
-}
-
-async fn ssh_ai2(cmd: &str) -> Result<String, String> {
-    let out = tokio::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "ai2", cmd])
-        .output()
-        .await
-        .map_err(|e| format!("ssh spawn failed: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "ssh exit {:?}: {}",
-            out.status.code(),
-            err.lines().next().unwrap_or("unknown error")
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-/// One combined SSH batch for ai2 (meminfo, df, storage checks, GPU apps,
-/// docker ps, per-PID proc samples). Minimizes SSH calls per tick.
-const AI2_BLOB: &str = "echo '===MEMINFO==='; grep -E '^(MemTotal|MemAvailable|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo; \
-echo '===DFROOT==='; df -B1 /; \
-echo '===FINDMNT==='; findmnt -n -o FSTYPE,OPTIONS /mnt/nvmeof; \
-echo '===DFNVMEOF==='; df -B1 /mnt/nvmeof; \
-echo '===STAT==='; stat -t /mnt/nvmeof/repos /mnt/nvmeof/huggingface >/dev/null 2>&1 && echo OK || echo FAIL; \
-echo '===GPUAPPS==='; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null; \
-echo '===DOCKERPS==='; docker ps --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev/null; \
-echo '===PROCS==='; for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
-rss=$(grep VmRSS /proc/$p/status 2>/dev/null | awk '{print $2}'); cg=$(tail -1 /proc/$p/cgroup 2>/dev/null); \
-cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200); echo \"PROC $p ${rss:-0} $cg\"; echo \"CMD $cm\"; done; \
-echo '===END==='";
-
-/// Storage gatekeeper pass (ai local + ai2 via ssh), every check timeout-wrapped.
-async fn collect_storage() -> StorageState {
-    let mut checks = StorageChecks::default();
-    let mut reasons: Vec<String> = Vec::new();
-
-    // --- ai (local) ---
-    let fm = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        run_cmd("findmnt", &["-n", "-o", "FSTYPE,OPTIONS", "/mnt/nvmeof"]),
-    )
-    .await;
-    checks.ai_findmnt = matches!(fm, Ok(Some(s)) if s.contains("gfs2"));
-    if !checks.ai_findmnt {
-        reasons.push("ai: findmnt /mnt/nvmeof not gfs2 (or timed out)".into());
-    }
-
-    let md = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
-        tokio::fs::read_to_string("/proc/mdstat").await.map_err(|e| e.to_string())
-    })
-    .await;
-    checks.ai_mdstat = matches!(&md, Ok(Ok(s)) if s.contains("md0 : active raid0"));
-    if !checks.ai_mdstat {
-        reasons.push("ai: /proc/mdstat missing 'md0 : active raid0'".into());
-    }
-
-    let st = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
-        tokio::process::Command::new("stat")
-            .args(["/mnt/nvmeof/repos", "/mnt/nvmeof/huggingface"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .map_err(|e| e.to_string())
-    })
-    .await;
-    checks.ai_stat = matches!(st, Ok(Ok(true)));
-    if !checks.ai_stat {
-        reasons.push("ai: stat /mnt/nvmeof/{repos,huggingface} failed (GFS2 hang?)".into());
-    }
-
-    // df for the shared GFS2 fs (only meaningful when gate passes; use ai's view).
-    let df_nvmeof = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        run_cmd("df", &["-B1", "/mnt/nvmeof"]),
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|s| parse_df(&s));
-
-    // --- ai2 (via one combined ssh blob) ---
-    let blob = tokio::time::timeout(
-        Duration::from_secs(SSH_BLOB_TIMEOUT_SECS),
-        ssh_ai2(AI2_BLOB),
-    )
-    .await;
-    let sec = match blob {
-        Ok(Ok(s)) => sections(&s),
-        Ok(Err(e)) => {
-            reasons.push(format!("ai2: unreachable ({e})"));
-            HashMap::new()
-        }
-        Err(_) => {
-            reasons.push("ai2: ssh blob timed out".into());
-            HashMap::new()
-        }
-    };
-    checks.ai2_findmnt = sec.get("FINDMNT").map(|s| s.contains("gfs2")).unwrap_or(false);
-    if !checks.ai2_findmnt {
-        reasons.push("ai2: findmnt /mnt/nvmeof not gfs2".into());
-    }
-    checks.ai2_stat = sec.get("STAT").map(|s| s.contains("OK")).unwrap_or(false);
-    if !checks.ai2_stat {
-        reasons.push("ai2: stat /mnt/nvmeof/{repos,huggingface} failed".into());
-    }
-
-    let online = checks.ai_findmnt && checks.ai_mdstat && checks.ai_stat && checks.ai2_findmnt && checks.ai2_stat;
-    let df = df_nvmeof;
-
-    StorageState {
-        online,
-        fstype: if online { Some("gfs2".into()) } else { None },
-        reason: if online { None } else { Some(reasons.join("; ")) },
-        total_bytes: df.map(|d| d.0),
-        used_bytes: df.map(|d| d.1),
-        avail_bytes: df.map(|d| d.2),
-        checks,
-    }
-}
-
-async fn node_from_blob(blob: &str) -> NodeState {
-    let sec = sections(blob);
-    let mem = sec.get("MEMINFO").and_then(|s| parse_meminfo(s));
-    let disk = sec.get("DFROOT").and_then(|s| parse_df(s));
-    NodeState {
-        mem_total_bytes: mem.map(|m| m.0 * 1024),
-        mem_available_bytes: mem.map(|m| m.1 * 1024),
-        mem_used_bytes: mem.map(|m| m.0.saturating_sub(m.1) * 1024),
-        mem_cache_bytes: mem.map(|m| m.2 * 1024),
-        swap_total_bytes: mem.map(|m| m.3 * 1024),
-        swap_used_bytes: mem.map(|m| m.4 * 1024),
-        disk_root: disk.map(|d| DiskInfo {
-            total_bytes: d.0,
-            used_bytes: d.1,
-            avail_bytes: d.2,
-            use_pct: d.3,
-        }),
-    }
-}
-
-async fn collect_nodes() -> BTreeMap<String, Option<NodeState>> {
-    let mut out = BTreeMap::new();
-
-    // ai — local reads, each timeout-wrapped.
-    let meminfo = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
-        tokio::fs::read_to_string("/proc/meminfo").await.map_err(|e| e.to_string())
-    })
-    .await;
-    let df_root = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        run_cmd("df", &["-B1", "/"]),
-    )
-    .await;
-    let ai_node = match (meminfo, df_root) {
-        (Ok(Ok(m)), Ok(df)) => {
-            let mem = parse_meminfo(&m);
-            let disk = df.as_deref().and_then(parse_df);
-            Some(NodeState {
-                mem_total_bytes: mem.map(|m| m.0 * 1024),
-                mem_available_bytes: mem.map(|m| m.1 * 1024),
-                mem_used_bytes: mem.map(|m| m.0.saturating_sub(m.1) * 1024),
-                mem_cache_bytes: mem.map(|m| m.2 * 1024),
-                swap_total_bytes: mem.map(|m| m.3 * 1024),
-                swap_used_bytes: mem.map(|m| m.4 * 1024),
-                disk_root: disk.map(|d| DiskInfo {
-                    total_bytes: d.0,
-                    used_bytes: d.1,
-                    avail_bytes: d.2,
-                    use_pct: d.3,
-                }),
-            })
-        }
-        _ => None,
-    };
-    out.insert("ai".into(), ai_node);
-
-    // ai2 — single combined ssh blob.
-    let blob = tokio::time::timeout(Duration::from_secs(SSH_BLOB_TIMEOUT_SECS), ssh_ai2(AI2_BLOB)).await;
-    out.insert(
-        "ai2".into(),
-        match blob {
-            Ok(Ok(s)) => Some(node_from_blob(&s).await),
-            _ => None,
-        },
-    );
-
-    out
-}
-
-fn proc_rss(pid: u32) -> Option<u64> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-    let kb: u64 = s
-        .lines()
-        .find(|l| l.starts_with("VmRSS:"))?
-        .split_whitespace()
-        .nth(1)?
-        .parse()
-        .ok()?;
-    Some(kb * 1024)
-}
-
-fn proc_container(pid: u32) -> Option<String> {
-    let s = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
-    let line = s.lines().find(|l| l.contains("docker-"))?;
-    let rest = line.split("docker-").nth(1)?;
-    let id = rest.trim_end_matches(".scope").trim();
-    if id.len() == 64 {
-        Some(id.to_string())
-    } else {
-        None
-    }
-}
-
-fn proc_cmdline(pid: u32) -> String {
-    std::fs::read(format!("/proc/{pid}/cmdline"))
-        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
-        .unwrap_or_default()
-}
-
-/// Fallback substring used when an entry has neither containers nor
-/// process_match (e.g. "DeepSeek-v4.1-Flash-2x-DGX-Spark" -> "deepseek").
-fn entry_fallback_match(e: &RegistryEntry) -> String {
-    let first = e
-        .id
-        .split(|c: char| c == '-' || c == ' ' || c == '(')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if first.len() >= 4 {
-        first
-    } else {
-        e.id.to_ascii_lowercase()
-    }
-}
-
-fn entry_matches_pid(e: &RegistryEntry, name: Option<&str>, cmdline: &str) -> bool {
-    let cl = cmdline.to_ascii_lowercase();
-    if let Some(hex) = name {
-        if e.containers.iter().any(|c| c == hex) {
-            return true;
-        }
-    }
-    if let Some(pm) = &e.process_match {
-        if cl.contains(&pm.to_ascii_lowercase()) {
-            return true;
-        }
-    }
-    if e.containers.is_empty() && e.process_match.is_none() {
-        return cl.contains(&entry_fallback_match(e));
-    }
-    false
-}
-
-fn attribute_pids(
-    gpu: Vec<(u32, u64)>,
-    docker: &HashMap<String, String>,
-    procs: Vec<ProcInfo>,
-    registry: &[RegistryEntry],
-) -> HashMap<String, u64> {
-    let by_pid: HashMap<u32, &ProcInfo> = procs.iter().map(|p| (p.pid, p)).collect();
-    let mut out: HashMap<String, u64> = HashMap::new();
-    for (pid, gpu_bytes) in gpu {
-        let rss = by_pid.get(&pid).map(|p| p.rss_bytes).unwrap_or(0);
-        let total = gpu_bytes + rss;
-        let cmdline = by_pid.get(&pid).map(|p| p.cmdline.as_str()).unwrap_or("");
-        let cname = by_pid
-            .get(&pid)
-            .and_then(|p| p.container_hex.as_ref())
-            .and_then(|hex| docker.get(hex))
-            .map(|s| s.as_str());
-        for e in registry {
-            if entry_matches_pid(e, cname, cmdline) {
-                *out.entry(e.id.clone()).or_insert(0) += total;
-                break; // attribute each pid to exactly one entry
-            }
-        }
-    }
-    out
-}
-
-/// Parse the ===PROCS=== / ===CMD=== section emitted by AI2_BLOB.
-fn parse_remote_procs(s: &str) -> Vec<ProcInfo> {
-    let mut out: Vec<ProcInfo> = Vec::new();
-    let mut cur: Option<ProcInfo> = None;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("PROC ") {
-            if let Some(p) = cur.take() {
-                out.push(p);
-            }
-            let mut it = rest.split_whitespace();
-            let pid: u32 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let rss: u64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let cg = it.collect::<Vec<_>>().join(" ");
-            let container_hex = if cg.contains("docker-") {
-                cg.split("docker-")
-                    .nth(1)
-                    .map(|x| x.trim_end_matches(".scope").trim())
-                    .filter(|id| id.len() == 64)
-                    .map(|id| id.to_string())
-            } else {
-                None
-            };
-            cur = Some(ProcInfo {
-                pid,
-                rss_bytes: rss * 1024,
-                container_hex,
-                cmdline: String::new(),
-            });
-        } else if let Some(rest) = line.strip_prefix("CMD ") {
-            if let Some(p) = cur.as_mut() {
-                p.cmdline = rest.to_string();
-            }
-        }
-    }
-    if let Some(p) = cur.take() {
-        out.push(p);
-    }
-    out
-}
-
-async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u64, u64)> {
-    // --- ai (local) ---
-    let gpu_ai = run_cmd(
-        "nvidia-smi",
-        &["--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
-    )
-    .await
-    .unwrap_or_default();
-    let docker_ai = run_cmd("docker", &["ps", "--no-trunc", "--format", "{{.ID}}|{{.Names}}"])
-        .await
-        .unwrap_or_default();
-    let procs_ai: Vec<ProcInfo> = parse_gpu_apps(&gpu_ai)
-        .iter()
-        .map(|(pid, _)| ProcInfo {
-            pid: *pid,
-            rss_bytes: proc_rss(*pid).unwrap_or(0),
-            container_hex: proc_container(*pid),
-            cmdline: proc_cmdline(*pid),
-        })
-        .collect();
-    let docker_map = parse_docker_ps(&docker_ai);
-    let ai_map = attribute_pids(parse_gpu_apps(&gpu_ai), &docker_map, procs_ai, registry);
-
-    // --- ai2 (from the same ssh blob used elsewhere; re-run it here) ---
-    let ai2_map = match tokio::time::timeout(Duration::from_secs(SSH_BLOB_TIMEOUT_SECS), ssh_ai2(AI2_BLOB)).await {
-        Ok(Ok(blob)) => {
-            let sec = sections(&blob);
-            let gpu = sec.get("GPUAPPS").map(|s| parse_gpu_apps(s)).unwrap_or_default();
-            let docker = sec
-                .get("DOCKERPS")
-                .map(|s| parse_docker_ps(s))
-                .unwrap_or_default();
-            let procs = sec.get("PROCS").map(|s| parse_remote_procs(s)).unwrap_or_default();
-            attribute_pids(gpu, &docker, procs, registry)
-        }
-        _ => HashMap::new(),
-    };
-
-    let mut ids: Vec<String> = registry.iter().map(|e| e.id.clone()).collect();
-    ids.extend(ai_map.keys().cloned());
-    ids.extend(ai2_map.keys().cloned());
-    let mut out = HashMap::new();
-    for id in ids {
-        let a = ai_map.get(&id).copied().unwrap_or(0);
-        let b = ai2_map.get(&id).copied().unwrap_or(0);
-        out.insert(id, (a, b));
-    }
-    out
-}
-
-// --------------------------- HTTP telemetry ----------------------------------
-
-#[derive(Debug, Default)]
-struct CollectorState {
-    prev: HashMap<String, Prev>,
-}
-
-async fn probe_entry(e: &RegistryEntry, prev: &mut Prev, client: &reqwest::Client) -> ProbeResult {
-    let url = format!("http://{}:{}", e.host, e.port);
-    match e.engine.as_str() {
-        "tensorfold" => probe_tensorfold(e, &url, prev, client).await,
-        "velogb10" => probe_velogb10(e, &url, prev, client).await,
-        _ => probe_vllm(e, &url, prev, client).await,
-    }
-}
-
-fn fail_probe(msg: String) -> ProbeResult {
-    ProbeResult {
-        ok: false,
-        detail: Some(msg),
-        ..Default::default()
-    }
-}
-
-async fn probe_tensorfold(
-    _e: &RegistryEntry,
-    url: &str,
-    prev: &mut Prev,
-    client: &reqwest::Client,
-) -> ProbeResult {
-    let now = Instant::now();
-    let v: Value = match client.get(format!("{url}/health")).send().await {
-        Ok(r) => match r.json().await {
-            Ok(v) => v,
-            Err(e) => return fail_probe(format!("health json: {e}")),
-        },
-        Err(e) => return fail_probe(format!("http: {e}")),
-    };
-    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-    if !ok {
-        return fail_probe("health ok=false".into());
-    }
-    let total = jnum(&v, "completion_tokens_total");
-    let decode = jf(&v, "decode_seconds_total");
-    let concurrent = jnum(&v, "requests_running").or_else(|| jnum(&v, "inflight"));
-    let live = match (prev.total, total, prev.decode_s, decode) {
-        (Some(pt), Some(nt), Some(pd), Some(nd)) if nd > pd => Some((nt - pt) as f64 / (nd - pd)),
-        (Some(_), Some(_), _, _) => Some(0.0),
-        _ => None,
-    };
-    let lifetime = match (total, decode) {
-        (Some(t), Some(d)) if d > 0.0 => Some(t as f64 / d),
-        _ => None,
-    };
-    let p = std::mem::take(prev);
-    *prev = Prev {
-        total,
-        decode_s: decode,
-        at: if p.at.is_some() { p.at } else { Some(now) },
-    };
-    ProbeResult {
-        ok: true,
-        detail: None,
-        served_model: None,
-        concurrent,
-        queued: None,
-        live_tok_per_sec: live,
-        lifetime_decode: lifetime,
-        total_tokens: total,
-        prompt_tokens: jnum(&v, "prompt_tokens_total"),
-        cached_tokens: jnum(&v, "cached_tokens_total"),
-    }
-}
-
-fn parse_prom_metric(text: &str, key: &str) -> Option<f64> {
-    text.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .find_map(|l| {
-            let mut it = l.split_whitespace();
-            if it.next() == Some(key) {
-                it.next().and_then(|v| v.parse().ok())
-            } else {
-                None
-            }
-        })
-}
-
-async fn probe_vllm(_e: &RegistryEntry, url: &str, prev: &mut Prev, client: &reqwest::Client) -> ProbeResult {
-    let now = Instant::now();
-    // Liveness + served model name. NOTE: must check HTTP status — another
-    // engine may share this host:port and answer 401 with a JSON error body
-    // (parses fine but is NOT liveness).
-    let models: Value = match client.get(format!("{url}/v1/models")).send().await {
-        Ok(r) => {
-            let status = r.status();
-            if !status.is_success() {
-                return fail_probe(format!("models http {status}"));
-            }
-            match r.json().await {
-                Ok(v) => v,
-                Err(e) => return fail_probe(format!("models json: {e}")),
-            }
-        }
-        Err(err) => return fail_probe(format!("http: {err}")),
-    };
-    let served = models
-        .get("data")
-        .and_then(|d| d.as_array())
-        .and_then(|a| a.first())
-        .and_then(|m| m.get("id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
-
-    // Metrics are best-effort (may be disabled); only trust a 2xx body.
-    let metrics: Option<String> = match client.get(format!("{url}/metrics")).send().await {
-        Ok(r) if r.status().is_success() => r.text().await.ok(),
-        _ => None,
-    };
-    let (concurrent, queued, total) = match &metrics {
-        Some(txt) => {
-            let run = parse_prom_metric(txt, "vllm:num_requests_running").map(|f| f as u64);
-            let wait = parse_prom_metric(txt, "vllm:num_requests_waiting").map(|f| f as u64);
-            let tot = parse_prom_metric(txt, "vllm:generation_tokens_total").map(|f| f as u64);
-            let fallback_conc = if txt.contains("http_requests_total") { Some(0) } else { None };
-            (run.or(fallback_conc), wait, tot)
-        }
-        None => (None, None, None),
-    };
-    let live = match (prev.total, total) {
-        (Some(pt), Some(nt)) if nt > pt => {
-            let dt = prev.at.map(|a| now.duration_since(a).as_secs_f64()).unwrap_or(0.0);
-            if dt > 0.0 {
-                Some((nt - pt) as f64 / dt)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-    *prev = Prev {
-        total,
-        decode_s: prev.decode_s,
-        at: Some(now),
-    };
-    ProbeResult {
-        ok: true,
-        detail: if metrics.is_some() {
-            None
-        } else {
-            Some("stats disabled; liveness via /v1/models".into())
-        },
-        served_model: served,
-        concurrent,
-        queued,
-        live_tok_per_sec: live,
-        lifetime_decode: None,
-        total_tokens: total,
-        prompt_tokens: None,
-        cached_tokens: None,
-    }
-}
-
-async fn probe_velogb10(
-    _e: &RegistryEntry,
-    url: &str,
-    prev: &mut Prev,
-    client: &reqwest::Client,
-) -> ProbeResult {
-    let now = Instant::now();
-    let v: Value = match client.get(format!("{url}/health")).send().await {
-        Ok(r) => match r.json().await {
-            Ok(v) => v,
-            Err(e) => return fail_probe(format!("health json: {e}")),
-        },
-        Err(e) => return fail_probe(format!("http: {e}")),
-    };
-    let ok = v.get("status").and_then(|x| x.as_str()) == Some("ok");
-    if !ok {
-        return fail_probe("status != ok".into());
-    }
-    let mtp = &v["telemetry"]["mtp"];
-    let df = &v["telemetry"]["dflash2"];
-    let mtp_emitted = mtp.get("emitted").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64;
-    let df_emitted = df.get("emitted").and_then(|x| x.as_f64()).unwrap_or(0.0) as u64;
-    let total = Some(mtp_emitted + df_emitted);
-    let step = v["telemetry"]["step_ms_p50"].as_f64();
-    let yield_sum = mtp.get("yield_tok_per_step").and_then(|x| x.as_f64()).unwrap_or(0.0)
-        + df.get("yield_tok_per_step").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let live = match (prev.total, total) {
-        (Some(pt), Some(nt)) if nt > pt => {
-            let dt = prev.at.map(|a| now.duration_since(a).as_secs_f64()).unwrap_or(0.0);
-            if dt > 0.0 {
-                Some((nt - pt) as f64 / dt)
-            } else {
-                None
-            }
-        }
-        _ => {
-            if let Some(s) = step {
-                if s > 0.0 && yield_sum > 0.0 {
-                    Some(yield_sum * 1000.0 / s)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    };
-    *prev = Prev {
-        total,
-        decode_s: prev.decode_s,
-        at: Some(now),
-    };
-    ProbeResult {
-        ok: true,
-        detail: None,
-        served_model: None,
-        concurrent: None,
-        queued: None,
-        live_tok_per_sec: live,
-        lifetime_decode: None,
-        total_tokens: total,
-        prompt_tokens: None,
-        cached_tokens: None,
-    }
-}
-
-async fn probe_all(
-    registry: &[RegistryEntry],
-    prev: &mut HashMap<String, Prev>,
-    client: &reqwest::Client,
-) -> HashMap<String, ProbeResult> {
-    // Run all probes concurrently; each gets its own prev cell.
-    let mut handles = Vec::new();
-    for e in registry {
-        let id = e.id.clone();
-        let e = e.clone();
-        let mut p = prev.remove(&id).unwrap_or_default();
-        let client = client.clone();
-        handles.push(tokio::spawn(async move {
-            let r = probe_entry(&e, &mut p, &client).await;
-            (id, p, r)
-        }));
-    }
-    let mut out = HashMap::new();
-    for h in handles {
-        if let Ok((id, p, r)) = h.await {
-            prev.insert(id.clone(), p);
-            out.insert(id, r);
-        }
-    }
-    out
-}
-
-// =============================================================================
-// 6. SHARED-STATE PUBLISHING LOOPS
-// =============================================================================
-
-async fn http_loop(shared: Arc<Shared>, client: reqwest::Client) {
-    let mut cs = CollectorState::default();
-    let mut interval = tokio::time::interval(Duration::from_secs(HTTP_INTERVAL_SECS));
-    loop {
-        interval.tick().await;
-        let registry = shared.registry.read().unwrap().clone();
-        let results = probe_all(&registry, &mut cs.prev, &client).await;
-
-        // Resolve graces whose endpoint state is now known.
-        {
-            let grace = shared.grace.lock().unwrap();
-            let mut resolved = Vec::new();
-            for (id, (kind, _)) in grace.iter() {
-                let ok = results.get(id).map(|r| r.ok).unwrap_or(false);
-                if (matches!(kind, GraceKind::Starting) && ok)
-                    || (matches!(kind, GraceKind::Stopping) && !ok)
-                {
-                    resolved.push(id.clone());
-                }
-            }
-            drop(grace);
-            let mut g = shared.grace.lock().unwrap();
-            for id in resolved {
-                g.remove(&id);
-            }
-        }
-
-        // Derive per-entry state (RUNNING / STARTING / STOPPED) from probe + grace.
-        let states: HashMap<String, String> = {
-            let grace = shared.grace.lock().unwrap();
-            registry
-                .iter()
-                .map(|e| {
-                    let ok = results.get(&e.id).map(|r| r.ok).unwrap_or(false);
-                    let state = if ok {
-                        "RUNNING"
-                    } else if let Some((GraceKind::Starting, at)) = grace.get(&e.id) {
-                        if at.elapsed() < Duration::from_secs(STARTING_GRACE_SECS) {
-                            "STARTING"
-                        } else {
-                            "STOPPED"
-                        }
-                    } else {
-                        "STOPPED"
-                    };
-                    (e.id.clone(), state.to_string())
-                })
-                .collect()
-        };
-        *shared.probes.write().unwrap() = results;
-        *shared.states.write().unwrap() = states;
-        shared.publish();
-    }
-}
-
-async fn sys_loop(shared: Arc<Shared>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(SYS_INTERVAL_SECS));
-    loop {
-        interval.tick().await;
-        let storage = collect_storage().await;
-        let nodes = collect_nodes().await;
-        let registry = shared.registry.read().unwrap().clone();
-        let mem = collect_mem_attr(&registry).await;
-        *shared.storage.write().unwrap() = storage;
-        *shared.nodes.write().unwrap() = nodes;
-        *shared.mem.write().unwrap() = mem;
-        shared.publish();
-    }
-}
-
-// =============================================================================
-// 7. LIFECYCLE ACTIONS
-// =============================================================================
-
-enum Action {
-    Start(String),
-    Stop(String),
-    Add(RegistryEntry),
-    Remove(String),
-    DropCaches,
-    ShowLog(String),
-}
-
-enum UiMsg {
-    Message(String),
-    Log { id: String, lines: Vec<String> },
-}
-
-use tokio::process::Command as TokioCommand;
-
-/// Spawn a lifecycle command fully detached (setsid, stdin null, output
-/// appended to the entry's log file) so quitting the TUI never kills children.
-async fn spawn_detached(cwd: &str, cmd: &str, log_path: &Path) -> Result<(), String> {
-    use std::process::Stdio;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_err(|e| format!("open log {}: {e}", log_path.display()))?;
-    let stderr = file
-        .try_clone()
-        .map_err(|e| format!("clone log handle: {e}"))?;
-    TokioCommand::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(file))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .map_err(|e| format!("spawn `{cmd}` in {cwd}: {e}"))?;
-    Ok(())
-}
-
-async fn run_action(action: Action, shared: &Arc<Shared>, ui_tx: &mpsc::UnboundedSender<UiMsg>) {
-    match action {
-        Action::Start(id) => {
-            let entry = shared.registry.read().unwrap().iter().find(|e| e.id == id).cloned();
-            let Some(e) = entry else { return };
-            let log = log_file_for(&e.id);
-            let msg = match spawn_detached(&e.path, &e.start, &log).await {
-                Ok(()) => {
-                    shared
-                        .grace
-                        .lock()
-                        .unwrap()
-                        .insert(e.id.clone(), (GraceKind::Starting, Instant::now()));
-                    format!("started `{}` (logs: {})", e.id, log.display())
-                }
-                Err(err) => format!("start failed: {err}"),
-            };
-            let _ = ui_tx.send(UiMsg::Message(msg));
-        }
-        Action::Stop(id) => {
-            let entry = shared.registry.read().unwrap().iter().find(|e| e.id == id).cloned();
-            let Some(e) = entry else { return };
-            let log = log_file_for(&e.id);
-            let msg = match spawn_detached(&e.path, &e.stop, &log).await {
-                Ok(()) => {
-                    shared
-                        .grace
-                        .lock()
-                        .unwrap()
-                        .insert(e.id.clone(), (GraceKind::Stopping, Instant::now()));
-                    format!("stopping `{}` (logs: {})", e.id, log.display())
-                }
-                Err(err) => format!("stop failed: {err}"),
-            };
-            let _ = ui_tx.send(UiMsg::Message(msg));
-        }
-        Action::Add(entry) => {
-            let res = {
-                let mut reg = shared.registry.write().unwrap();
-                if reg.iter().any(|e| e.id == entry.id) {
-                    Err(format!("entry `{}` already exists", entry.id))
-                } else {
-                    reg.push(entry.clone());
-                    save_registry(&reg).map(|_| format!("added `{}` to registry", entry.id))
-                }
-            };
-            // Next publish tick picks up the new entry.
-            let _ = ui_tx.send(UiMsg::Message(match res {
-                Ok(m) => m,
-                Err(e) => e,
-            }));
-        }
-        Action::Remove(id) => {
-            let res = {
-                let mut reg = shared.registry.write().unwrap();
-                let before = reg.len();
-                reg.retain(|e| e.id != id);
-                if reg.len() == before {
-                    Err(format!("entry `{id}` not found"))
-                } else {
-                    // never deletes files, only the registry record
-                    save_registry(&reg).map(|_| format!("removed `{id}` from registry (files kept)"))
-                }
-            };
-            let _ = ui_tx.send(UiMsg::Message(match res {
-                Ok(m) => m,
-                Err(e) => e,
-            }));
-        }
-        Action::DropCaches => {
-            let local = tokio::process::Command::new("sh")
-                .args(["-c", "sudo -n sync && sudo -n sysctl -w vm.drop_caches=3"])
-                .output()
-                .await;
-            let remote = tokio::time::timeout(
-                Duration::from_secs(5),
-                ssh_ai2("sudo -n sync && sudo -n sysctl -w vm.drop_caches=3"),
-            )
-            .await;
-            let msg = format!(
-                "drop_caches: ai {} | ai2 {}",
-                match &local {
-                    Ok(o) if o.status.success() => "ok".to_string(),
-                    Ok(_) => "failed (needs passwordless sudo)".to_string(),
-                    Err(e) => format!("error: {e}"),
-                },
-                match remote {
-                    Ok(Ok(_)) => "ok".to_string(),
-                    Ok(Err(e)) => format!("failed ({e})"),
-                    Err(_) => "timed out".to_string(),
-                }
-            );
-            let _ = ui_tx.send(UiMsg::Message(msg));
-        }
-        Action::ShowLog(id) => {
-            let entry = shared.registry.read().unwrap().iter().find(|e| e.id == id).cloned();
-            let Some(e) = entry else { return };
-            let mut lines = Vec::new();
-            let log = log_file_for(&e.id);
-            lines.push(format!("── tail {} ──", log.display()));
-            match tokio::fs::read_to_string(&log).await {
-                Ok(data) => {
-                    let all: Vec<&str> = data.lines().collect();
-                    let skip = all.len().saturating_sub(200);
-                    lines.extend(all.into_iter().skip(skip).map(|s| s.to_string()));
-                }
-                Err(err) => lines.push(format!("(cannot read log: {err})")),
-            }
-            for c in &e.containers {
-                lines.push(format!("── docker logs --tail 50 {c} ──"));
-                let cmd = if is_ai2_host(&e.host) {
-                    format!("ssh -o BatchMode=yes -o ConnectTimeout=3 ai2 'docker logs --tail 50 {c}'")
-                } else {
-                    format!("docker logs --tail 50 {c}")
-                };
-                match tokio::time::timeout(Duration::from_secs(5), async {
-                    tokio::process::Command::new("sh").arg("-c").arg(&cmd).output().await
-                })
-                .await
-                {
-                    Ok(Ok(o)) => {
-                        lines.push(String::from_utf8_lossy(&o.stdout).to_string());
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        if !err.trim().is_empty() {
-                            lines.push(err.to_string());
-                        }
-                    }
-                    _ => lines.push("(docker logs failed/timed out)".into()),
-                }
-            }
-            let _ = ui_tx.send(UiMsg::Log { id: e.id, lines });
-        }
-    }
-}
-
-async fn action_loop(
-    mut rx: mpsc::UnboundedReceiver<Action>,
-    shared: Arc<Shared>,
-    ui_tx: mpsc::UnboundedSender<UiMsg>,
-) {
-    while let Some(a) = rx.recv().await {
-        run_action(a, &shared, &ui_tx).await;
-    }
-}
-
-// =============================================================================
-// 8. TUI
+// 1. TUI STATE
 // =============================================================================
 
 #[derive(Default)]
@@ -1491,6 +114,20 @@ struct UiState {
     log_view: Option<(String, Vec<String>)>,
 }
 
+enum Action {
+    Start(String),
+    Stop(String),
+    Add(RegistryEntry),
+    Remove(String),
+    DropCaches,
+    ShowLog(String),
+}
+
+enum UiMsg {
+    Message(String),
+    Log { id: String, lines: Vec<String> },
+}
+
 // --- add-modal script/env auto-detection ------------------------------------
 
 fn detect_launch(path: &str) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
@@ -1552,11 +189,13 @@ fn detect_launch(path: &str) -> (Option<String>, Option<String>, Option<String>,
     (start, stop, port, model)
 }
 
-// --- drawing -----------------------------------------------------------------
+// =============================================================================
+// 2. DRAWING
+// =============================================================================
 
 const KEYBAR: &str = "s start · x stop · l logs · a add · d del · c drop-caches · r refresh · q/Esc quit";
 
-fn draw(f: &mut Frame, app: &AppState, ui: &UiState) {
+fn draw(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState) {
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(3), // top bar
@@ -1584,7 +223,7 @@ fn draw(f: &mut Frame, app: &AppState, ui: &UiState) {
     }
 }
 
-fn draw_top_bar(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn draw_top_bar(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
     let st = &app.storage;
     let badge = if st.online {
         let used = st.used_bytes.unwrap_or(0);
@@ -1629,7 +268,7 @@ fn draw_top_bar(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn mem_gauge_label(node: &Option<NodeState>) -> (String, f64, Style) {
+fn mem_gauge_label(node: &Option<chronos_core::NodeState>) -> (String, f64, Style) {
     match node {
         Some(n) => {
             let total = n.mem_total_bytes.unwrap_or(0);
@@ -1666,7 +305,7 @@ fn mem_gauge_label(node: &Option<NodeState>) -> (String, f64, Style) {
     }
 }
 
-fn draw_node_half(f: &mut Frame, name: &str, node: &Option<NodeState>, area: ratatui::layout::Rect) {
+fn draw_node_half(f: &mut Frame, name: &str, node: &Option<chronos_core::NodeState>, area: ratatui::layout::Rect) {
     let block = Block::default().borders(Borders::ALL).title(name.to_string());
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1718,7 +357,7 @@ fn draw_node_half(f: &mut Frame, name: &str, node: &Option<NodeState>, area: rat
     f.render_widget(Paragraph::new(dlabel), rows[3]);
 }
 
-fn draw_nodes(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn draw_nodes(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
     let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     let ai = app.nodes.get("ai").cloned().flatten();
     let ai2 = app.nodes.get("ai2").cloned().flatten();
@@ -1726,9 +365,9 @@ fn draw_nodes(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     draw_node_half(f, "ai2 (worker · 192.168.20.229)", &ai2, halves[1]);
 }
 
-fn draw_endpoints(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
+fn draw_endpoints(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let active: Vec<&EntrySnapshot> = app
+    let active: Vec<&chronos_core::EntrySnapshot> = app
         .entries
         .iter()
         .filter(|e| e.state != "STOPPED")
@@ -1796,7 +435,7 @@ fn draw_endpoints(f: &mut Frame, app: &AppState, area: ratatui::layout::Rect) {
     );
 }
 
-fn draw_table(f: &mut Frame, app: &AppState, ui: &UiState, area: ratatui::layout::Rect) {
+fn draw_table(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState, area: ratatui::layout::Rect) {
     let header = Row::new(["Status", "Name", "Slot", "Port", "Mem", "Path"]).style(
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
     );
@@ -1838,7 +477,7 @@ fn draw_table(f: &mut Frame, app: &AppState, ui: &UiState, area: ratatui::layout
     f.render_stateful_widget(table, area, &mut ts);
 }
 
-fn draw_footer(f: &mut Frame, ui: &UiState, app: &AppState, area: ratatui::layout::Rect) {
+fn draw_footer(f: &mut Frame, ui: &UiState, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
     let mut spans = vec![Span::styled(KEYBAR, Style::default().fg(Color::DarkGray))];
     if let Some((m, at)) = &ui.message {
         if at.elapsed() < Duration::from_secs(8) {
@@ -1950,12 +589,14 @@ fn centered(area: ratatui::layout::Rect, w: u16, h: u16) -> ratatui::layout::Rec
     }
 }
 
-// --- key handling -------------------------------------------------------------
+// =============================================================================
+// 3. KEY HANDLING
+// =============================================================================
 
 fn handle_key(
     key: crossterm::event::KeyEvent,
     ui: &mut UiState,
-    app: &AppState,
+    app: &chronos_core::AppState,
     action_tx: &mpsc::UnboundedSender<Action>,
 ) {
     if key.kind != KeyEventKind::Press {
@@ -2105,7 +746,55 @@ fn handle_key(
     }
 }
 
-// --- terminal lifecycle --------------------------------------------------------
+// =============================================================================
+// 4. ACTION DISPATCH -> CORE
+// =============================================================================
+
+async fn run_action(action: Action, collector: &Collector, ui_tx: &mpsc::UnboundedSender<UiMsg>) {
+    match action {
+        Action::Start(id) => {
+            let msg = match collector.start(&id).await {
+                Ok(m) => m,
+                Err(e) => e,
+            };
+            let _ = ui_tx.send(UiMsg::Message(msg));
+        }
+        Action::Stop(id) => {
+            let msg = match collector.stop(&id).await {
+                Ok(m) => m,
+                Err(e) => e,
+            };
+            let _ = ui_tx.send(UiMsg::Message(msg));
+        }
+        Action::Add(entry) => {
+            let msg = collector.add(entry).await.unwrap_or_else(|e| e);
+            // Next publish tick picks up the new entry.
+            let _ = ui_tx.send(UiMsg::Message(msg));
+        }
+        Action::Remove(id) => {
+            let msg = collector.remove(&id).await.unwrap_or_else(|e| e);
+            let _ = ui_tx.send(UiMsg::Message(msg));
+        }
+        Action::DropCaches => {
+            let r = collector.drop_caches().await;
+            let _ = ui_tx.send(UiMsg::Message(format!(
+                "drop_caches: ai {} | ai2 {}",
+                r.ai, r.ai2
+            )));
+        }
+        Action::ShowLog(id) => {
+            let lines = match collector.entry_logs(&id).await {
+                Ok(lines) => lines,
+                Err(err) => vec![format!("(cannot read log: {err})")],
+            };
+            let _ = ui_tx.send(UiMsg::Log { id, lines });
+        }
+    }
+}
+
+// =============================================================================
+// 5. TERMINAL LIFECYCLE + MAIN
+// =============================================================================
 
 struct TermGuard;
 impl Drop for TermGuard {
@@ -2116,36 +805,15 @@ impl Drop for TermGuard {
 }
 
 async fn run_tui() {
-    let client = build_client();
-    let registry = load_registry();
-    let (tx, rx) = watch::channel(Arc::new(AppState::default()));
+    let collector = Arc::new(Collector::spawn());
+    let rx = collector.subscribe();
     let (action_tx, action_rx) = mpsc::unbounded_channel::<Action>();
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
 
-    let storage = StorageState::default();
-    let nodes: BTreeMap<String, Option<NodeState>> = BTreeMap::new();
-    let mem: HashMap<String, (u64, u64)> = HashMap::new();
-    let probes: HashMap<String, ProbeResult> = HashMap::new();
-    let states: HashMap<String, String> = registry
-        .iter()
-        .map(|e| (e.id.clone(), "STOPPED".to_string()))
-        .collect();
-    let shared = Arc::new(Shared {
-        tx,
-        registry: RwLock::new(registry),
-        storage: RwLock::new(storage),
-        nodes: RwLock::new(nodes),
-        mem: RwLock::new(mem),
-        probes: RwLock::new(probes),
-        states: RwLock::new(states),
-        grace: Mutex::new(HashMap::new()),
+    let actions_collector = collector.clone();
+    tokio::spawn(async move {
+        run_action_loop(action_rx, actions_collector, ui_tx.clone()).await;
     });
-    // publish the initial snapshot so the first frame has data
-    shared.publish();
-
-    tokio::spawn(http_loop(shared.clone(), client));
-    tokio::spawn(sys_loop(shared.clone()));
-    tokio::spawn(action_loop(action_rx, shared.clone(), ui_tx.clone()));
 
     let _guard = TermGuard;
     enable_raw_mode().expect("enable_raw_mode");
@@ -2190,37 +858,26 @@ async fn run_tui() {
     // TermGuard restores raw mode + screen.
 }
 
-// =============================================================================
-// 9. MAIN + DUMP STATE
-// =============================================================================
+use std::sync::Arc;
 
-async fn run_dump() {
-    let client = build_client();
-    let registry = load_registry();
-    let mut cs = CollectorState::default();
-
-    let storage = collect_storage().await;
-    let nodes = collect_nodes().await;
-    let mem = collect_mem_attr(&registry).await;
-    let probes = probe_all(&registry, &mut cs.prev, &client).await;
-
-    let mut states: HashMap<String, String> = HashMap::new();
-    for e in &registry {
-        let ok = probes.get(&e.id).map(|p| p.ok).unwrap_or(false);
-        states.insert(e.id.clone(), if ok { "RUNNING" } else { "STOPPED" }.to_string());
+async fn run_action_loop(
+    mut rx: mpsc::UnboundedReceiver<Action>,
+    collector: Arc<Collector>,
+    ui_tx: mpsc::UnboundedSender<UiMsg>,
+) {
+    while let Some(a) = rx.recv().await {
+        run_action(a, &collector, &ui_tx).await;
     }
-
-    let app = assemble(&registry, &storage, &nodes, &mem, &probes, &states);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&app).unwrap_or_else(|_| "{}".to_string())
-    );
 }
 
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--dump-state") {
-        run_dump().await;
+        let state = chronos_core::run_dump_state().await;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string())
+        );
         return;
     }
     run_tui().await;
