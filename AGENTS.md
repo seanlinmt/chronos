@@ -1,48 +1,67 @@
-# AGENTS.md — spark-deck-http
+# AGENTS.md — chronos
 
 ## What this repo is
 
-**Staging repo only.** The source of truth for a running service that lives elsewhere:
+**Staging repo only.** Source of truth is the deployment on `ai`:
 
-- Deployed to `ai:/home/sean/spark-deck-http/` (2-node DGX Spark cluster; `ai` = head via passwordless SSH, `ai2` = worker reached from `ai`).
-- Built and run **on `ai`**, never locally — this Mac has no guarantee of cargo/Rust targets.
-- Files mirror 1:1: `Cargo.toml`, `src/main.rs` (entire server, single file), `static/index.html` (embedded via `include_str!`), `LICENSE`, `README.md`.
+- 2-node DGX Spark GB10 cluster: `ai` = head (passwordless SSH), `ai2` = worker (reached from `ai` via `ssh -o BatchMode=yes ai2`). GitHub: `seanlinmt/chronos` (renamed from spark-deck-http; remote URL updated).
+- Built and run **on `ai`**, never locally — the Mac has no guarantee of the Linux toolchain targets. Local Mac `cargo check` (1.99) is a typecheck filter only.
+- Cargo workspace, three crates:
+  - `crates/core` — ALL domain logic (registry, storage gatekeeper, GB10 per-PID GPU attribution, 3-engine probes, snapshot assembly, detached lifecycle). One source of truth; domain fixes land here once.
+  - `crates/tui` — `chronos-tui` bin: ratatui dashboard + `--dump-state` JSON mode. UI/keys only; domain via core.
+  - `crates/http` — `chronos-http` bin: axum on `:8090` + `static/index.html` (embedded, `include_str!`). The adapter maps core snapshot → the exact `/api/state` key set the web UI reads. **Do not change the shape** without diffing against the JS in `static/index.html`.
 
 ## Deployment flow (required order)
 
 1. Edit files here.
-2. `scp` changed files to `ai:/home/sean/spark-deck-http/` (same relative paths; `src/main.rs` → `src/main.rs`, `static/index.html` → `static/index.html`).
+2. scp changed files to `ai:~/chronos/` mirroring the crate layout (`crates/core/src/*.rs`, `crates/tui/src/main.rs`, `crates/http/src/main.rs`, `crates/http/static/index.html`, root manifests). Create dirs first if missing.
 3. Build detached — SSH drops mid-command otherwise:
    ```bash
-   ssh ai 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/spark-deck-http && nohup cargo build --release > build.log 2>&1 & echo started'
+   ssh ai 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/chronos && nohup cargo build --release > build.log 2>&1 & echo started'
    ```
 4. Check `build.log` until `Finished`; on errors, fix here, re-scp, rebuild.
-5. Restart if the binary changed: `ssh ai 'systemctl --user restart spark-deck-http'`.
-6. Verify: `curl -s http://127.0.0.1:8090/api/state | jq .` from `ai` (see README for expected shape).
+5. TUI: no restart needed; expose via `~/.local/bin/chronos-tui` symlink (already exists; also `spark-deck` → same binary as transitional alias). HTTP: `ssh ai 'systemctl --user restart chronos-http'`.
+6. Verify — **both** gates below.
 
 ## SSH gotcha
 
-`ssh ai` intermittently fails with `ssh: connect to host ai.<cluster-domain> port 22: Undefined error: 0` — transient, not a config problem. Wrap every SSH/SCP in a retry loop (`for i in 1 2 3; do ssh ... && break || sleep 6; done`). Do not conclude the host is down on first failure.
+`ssh ai` intermittently fails with `ssh: connect to host ai.clearpixels.org port 22: Undefined error: 0` — transient, not a config problem. Wrap every SSH/SCP in a retry loop (`for i in 1 2 3; do ssh ... && break || sleep 6; done`). Also note: remote commands ending in a command whose exit status is non-zero (e.g. bare `systemctl is-active`, `grep` with no match) will fail the whole SSH invocation — append `|| true` inside the remote command or the retry loop spins for nothing.
 
 ## Hard constraints (verified 2026-10)
 
-- **Never** write anything to `/mnt/nvmeof` or `/home/sean/repos` — GFS2 over NVMe-oF; if it hangs/unmounts the dashboard must stay up (it lives on local ext4 `/dev/nvme0n1p2`). Registry (`data/registry.json`) and logs are relative paths resolved from the service `WorkingDirectory=/home/sean/spark-deck-http`.
-- **Never** stop/restart containers `glm53-tf-r0`, `glm53-tf-r1`, `vllm_bge_m3`, `vllm_bge_reranker` — they are production inference servers; the dashboard only observes them.
-- Service: user systemd `spark-deck-http.service` (linger enabled). Manage with `systemctl --user {status,restart,stop}`; logs via `journalctl --user -u spark-deck-http -f`.
+- Everything lives under `/home/sean/chronos` (local ext4). **Never** write to `/mnt/nvmeof` or `/home/sean/repos` (GFS2; must not be a launch dependency). Registry: `~/chronos/data/registry.json`; logs: `~/chronos/logs/<id>.log`. Old installs `~/spark-deck` and `~/spark-deck-http` were retired, not deleted.
+- One **shared registry** — TUI and web see the same entry list. Editing it via either frontend affects both.
+- **Never** stop/restart containers `glm53-tf-r0`, `glm53-tf-r1`, `vllm_bge_m3`, `vllm_bge_reranker` — production inference servers; chronos only observes them.
+- **Detached lifecycle is load-bearing**: start/stop spawn via `sh -c` with `.process_group(0)`, stdin null, output appended to `logs/<id>.log` (in `crates/core/src/lifecycle.rs`). Quitting the TUI or restarting the service must never kill children.
+- `Collector::spawn()` must keep one watch receiver alive internally — dropping it makes every publish fail and subscribers freeze on the default snapshot (this bug was caught during the merge).
 
 ## Rust quirks that already cost a build
 
-- Deps are pinned by the deployed `Cargo.toml`: axum 0.8, tokio full, serde/serde_json, reqwest 0.12 (rustls-tls, **no default features**). Adding a crate means updating the remote `Cargo.toml` first.
+- Deps pinned in per-crate `Cargo.toml`s + workspace `Cargo.toml`: tokio full, serde/serde_json, reqwest 0.12 (rustls-tls, **no default features**), axum 0.8 (http), ratatui 0.29/crossterm 0.28 (tui), chrono. **Adding a crate means updating the remote manifests first** (remote Rust is 1.95.0; avoid crates needing newer).
+- `std::sync::MutexGuard` held across `.await` breaks tokio/axum `Send` bounds — clone what you need, drop the guard, then await.
+- **Always check HTTP status before parsing a probe body** (`r.status().is_success()` — enforced in all 3 engine probes now). Entries share `host:port` 8888; TensorFold's auth-gated endpoints return **401 with a valid JSON error body** — parsing without a status check fakes `RUNNING` (this exact bug shipped once). Non-2xx → fail with the status in `status_detail`.
 - axum 0.8 path params are `/{id}`, **not** `/:id`.
-- `std::sync::MutexGuard` held across `.await` breaks the `Handler` trait (future not `Send`) — clone what you need, drop the guard, then await. This produced the E0277 `Handler<_, _>` errors before.
-- `include_str!("../static/index.html")` fails the build if the static file is missing.
+- GB10 unified-memory fact: `docker stats`/`VmRSS` show only ~4–7 GiB CPU RSS and miss ~98 GiB of CUDA unified memory. Device-level `nvidia-smi` says `Memory-Usage: Not Supported`, but per-process works: `nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits`. True per-entry memory = Σ(GPU MiB + VmRSS), attributed via `/proc/<pid>/cgroup` `docker-<hex>.scope` ↔ `docker ps --no-trunc`, or `process_match` on cmdline.
+- `ai2` metrics come from **one combined SSH blob per 3s tick** (6s overall timeout) — do not split into multiple SSH calls per tick.
+- Env overrides: `CHRONOS_HOME` (base dir, for Mac/test runs), `CHRONOS_HTTP_PORT` (bind port, default 8090).
 
 ## Verification contract
 
-After any backend change, via `ssh ai`:
-- `storage.online == true` with all 5 checks true
-- `glm53-tensorfold-spark` RUNNING with `mem_total_bytes` ≈ 205–220 GB and non-null telemetry (`concurrent_requests`, `total_tokens_generated`)
-- `launch-embedding-ai-bge-m3` (ai, ~1.7 GB) and `launch-reranker-ai2-bge-reranker` (ai2, ~1.9 GB) RUNNING
-- `curl -s http://127.0.0.1:8090/ | head -c 50` serves the embedded HTML
+**Gate 1 — TUI (`--dump-state`):**
+```bash
+ssh ai 'cd ~/chronos && ./target/release/chronos-tui --dump-state | jq .'
+```
+- `storage.online == true`, all 5 checks true, avail ≈ 700+ GiB
+- `ai`/`ai2` `mem_total_bytes` ≈ 130 GB each, `mem_available_bytes` non-null
+- `glm53-tensorfold-spark` RUNNING, `mem_total_bytes` ≈ 205–220 GB, non-null telemetry (`concurrent_requests`, `total_tokens_generated`, `lifetime_decode_tok_per_sec`)
+- `DeepSeek-v4.1-Flash-2x-DGX-Spark` **STOPPED with `status_detail` ≈ "models http 401 Unauthorized" is the correct steady state** — it shares port 8888 with the running TensorFold. Do not "fix" this.
+- bge-m3 (:8891) and bge-reranker (:8892) RUNNING, ~1.7 GiB, non-null `served_model`
 
-Numbers drift with load; presence and rough magnitude are the contract, not exact values. GPU memory ~100 GiB per tensorfold rank is correct on GB10 (`docker stats`/`VmRSS` miss it — that's why per-PID `nvidia-smi --query-compute-apps` attribution exists).
+**Gate 2 — HTTP:**
+```bash
+ssh ai 'curl -s http://127.0.0.1:8090/api/state | jq ".entries[] | {id, status, served_model, mem_total_bytes}"'
+curl -s -o /dev/null -w "%{http_code}" http://192.168.20.63:8090/   # 200, ~32KB page
+```
+- Same statuses as Gate 1; entry objects carry all 18 keys incl. `telemetry.*` (see the adapter in `crates/http/src/main.rs`); `journalctl --user -u chronos-http` shows no errors.
+
+Local Mac runs show null `/proc`-derived fields — expected; runtime metrics are only real on `ai`. Rebuilding does **not** update an already-running TUI session — the user must quit (`q`) and relaunch.
