@@ -1,5 +1,5 @@
 // =============================================================================
-// chronos-tui — ratatui frontend for the 2-node NVIDIA DGX Spark (GB10)
+// chronos — ratatui frontend for the 2-node NVIDIA DGX Spark (GB10)
 // cluster (head: `ai`, worker: `ai2`).
 //
 // Thin consumer of chronos-core: background collectors, registry, engine

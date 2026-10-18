@@ -26,7 +26,7 @@ pub mod registry;
 pub mod state;
 
 // ---------------------------------------------------------------------------
-// Public API re-exports (consumed by chronos-tui and chronos-http)
+// Public API re-exports (consumed by chronos and chronos-http)
 // ---------------------------------------------------------------------------
 
 pub use collectors::{

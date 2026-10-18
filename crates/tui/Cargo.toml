@@ -1,12 +1,12 @@
 [package]
-name = "chronos-tui"
+name = "chronos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "ratatui TUI cluster-control / telemetry dashboard for the 2-node DGX Spark (GB10) cluster"
 
 [[bin]]
-name = "chronos-tui"
+name = "chronos"
 path = "src/main.rs"
 
 [dependencies]

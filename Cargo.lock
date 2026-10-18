@@ -173,6 +173,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronos"
+version = "0.1.0"
+dependencies = [
+ "chronos-core",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "chronos-core"
 version = "0.1.0"
 dependencies = [
@@ -191,17 +202,6 @@ dependencies = [
  "chronos-core",
  "reqwest",
  "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "chronos-tui"
-version = "0.1.0"
-dependencies = [
- "chronos-core",
- "crossterm",
- "ratatui",
  "serde_json",
  "tokio",
 ]
