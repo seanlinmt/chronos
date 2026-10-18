@@ -1,0 +1,22 @@
+[package]
+name = "spark-deck"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "TUI cluster-control / telemetry dashboard for a 2-node NVIDIA DGX Spark (GB10) cluster"
+
+[[bin]]
+name = "spark-deck"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 2
