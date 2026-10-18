@@ -1,0 +1,851 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spark Deck — DGX Cluster</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --card: #11151c;
+    --border: #1c2230;
+    --accent: #4f9cf9;
+    --green: #22c55e;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --text: #e5e9f0;
+    --muted: #8b94a7;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 20px;
+  }
+  main { max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .3px; }
+  h2 { font-size: 13px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); }
+  h3 { font-size: 15px; margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .spacer { flex: 1; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .grid-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+
+  /* ---- pills & badges ---- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; letter-spacing: .3px;
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.on   { background: rgba(34,197,94,.12);  color: var(--green); }
+  .pill.off  { background: rgba(239,68,68,.12);  color: var(--red); }
+  .pill.warn { background: rgba(245,158,11,.12); color: var(--amber); }
+  .pill.idle { background: rgba(139,148,167,.12); color: var(--muted); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 5px;
+    font-size: 11px; font-weight: 700; letter-spacing: .5px;
+  }
+  .badge.RUNNING  { background: rgba(34,197,94,.15);  color: var(--green); }
+  .badge.STOPPED  { background: rgba(139,148,167,.15); color: var(--muted); }
+  .badge.STARTING { background: rgba(245,158,11,.15); color: var(--amber); animation: pulse 1.4s ease-in-out infinite; }
+  .badge.STOPPING { background: rgba(245,158,11,.15); color: var(--amber); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+
+  .check { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
+  .check.ok  { background: var(--green); }
+  .check.bad { background: var(--red); }
+
+  /* ---- bars ---- */
+  .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width .4s ease; }
+  .bar > i.warn { background: var(--amber); }
+  .bar > i.crit { background: var(--red); }
+  .pct.warn { color: var(--amber); }
+  .pct.crit { color: var(--red); }
+  .big { font-size: 26px; font-weight: 700; line-height: 1.1; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; margin-top: 10px; }
+  .stat-grid .label { color: var(--muted); font-size: 12px; }
+
+  /* ---- buttons ---- */
+  .btn {
+    background: #1a2030; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 5px 12px; font: inherit; font-size: 12.5px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .btn:hover { background: #222a3d; border-color: #2c3550; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #6cadfa; }
+  .btn.danger { color: var(--red); }
+  .btn.danger:hover { background: rgba(239,68,68,.12); border-color: var(--red); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn.busy { pointer-events: none; opacity: .75; }
+  .btn.busy::before {
+    content: ""; display: inline-block; width: 11px; height: 11px;
+    border: 2px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; margin-right: 6px; vertical-align: -2px;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- table ---- */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
+  tbody tr:hover { background: rgba(79,156,249,.05); }
+  td.acts { white-space: nowrap; }
+  td.acts .btn { margin-right: 4px; }
+
+  /* ---- endpoint cards ---- */
+  .ep-card { display: flex; flex-direction: column; gap: 10px; }
+  .ep-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; font-size: 13px; }
+  .ep-stats .label { color: var(--muted); font-size: 11.5px; }
+  .unreachable { opacity: .45; }
+
+  /* ---- error banner ---- */
+  #errbanner {
+    display: none; max-width: 1400px; margin: 0 auto 16px;
+    background: rgba(239,68,68,.1); border: 1px solid var(--red);
+    color: var(--red); border-radius: 8px; padding: 10px 14px;
+    font-weight: 600; animation: pulse 1.6s ease-in-out infinite;
+  }
+  #errbanner.show { display: block; }
+
+  /* ---- toasts ---- */
+  #toasts { position: fixed; right: 18px; bottom: 18px; display: grid; gap: 8px; z-index: 300; max-width: 420px; }
+  .toast {
+    background: var(--card); border: 1px solid var(--border); border-left: 3px solid var(--green);
+    border-radius: 8px; padding: 10px 14px; font-size: 13px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.45); animation: slidein .18s ease-out;
+    word-break: break-word;
+  }
+  .toast.err { border-left-color: var(--red); }
+  @keyframes slidein { from { transform: translateY(8px); opacity: 0; } }
+
+  /* ---- modals ---- */
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    display: none; align-items: center; justify-content: center; z-index: 200; padding: 20px;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    width: min(560px, 100%); max-height: 90vh; overflow-y: auto; padding: 20px;
+  }
+  .modal h3 { margin-bottom: 14px; }
+  .field { margin-bottom: 12px; }
+  .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field input, .field select {
+    width: 100%; background: #0d1118; border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; padding: 7px 10px; font: inherit; font-size: 13px;
+  }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
+  .field .half { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .form-err { color: var(--red); font-size: 12.5px; min-height: 18px; margin: 6px 0; }
+
+  /* ---- log slide-over ---- */
+  #logpanel {
+    position: fixed; top: 0; right: 0; height: 100vh; z-index: 250;
+    width: min(720px, 100vw); background: var(--card);
+    border-left: 1px solid var(--border);
+    transform: translateX(102%); transition: transform .22s ease;
+    display: flex; flex-direction: column;
+  }
+  #logpanel.open { transform: translateX(0); }
+  #logpanel header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  #logpanel pre {
+    margin: 0; padding: 14px 16px; overflow: auto; flex: 1;
+    background: #0a0d13; color: #b7c2d8;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-all;
+  }
+
+  @media (max-width: 640px) {
+    body { padding: 12px; }
+    .stat-grid, .ep-stats { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div id="errbanner">connection lost, retrying…</div>
+
+<main>
+  <section class="card" id="topbar" aria-label="Storage and cluster status"></section>
+
+  <section class="card">
+    <h2>Nodes</h2>
+    <div class="grid2" id="nodes"></div>
+  </section>
+
+  <section class="card">
+    <h2>Active Inference Endpoints</h2>
+    <div class="grid-cards" id="active"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:12px">
+      <h2 style="margin:0">Registered Repos &amp; Launchers</h2>
+      <div class="spacer"></div>
+      <button class="btn primary" id="btn-add">+ Add Repo / Launcher</button>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>Path</th><th>Slot</th><th>Port</th><th>Engine</th>
+            <th>Status</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="regbody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- ===== Add / Register modal ===== -->
+<div class="overlay" id="addoverlay">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="addtitle">
+    <h3 id="addtitle">Add Repo / Launcher</h3>
+    <div class="field">
+      <label for="f-path">Repo path</label>
+      <div class="row" style="gap:8px; flex-wrap:nowrap">
+        <input id="f-path" type="text" placeholder="/home/sean/repos/my-repo" style="flex:1">
+        <button class="btn" id="btn-inspect" type="button">Auto-Detect</button>
+      </div>
+    </div>
+    <div class="field"><label for="f-name">Name</label><input id="f-name" type="text"></div>
+    <div class="field half">
+      <div><label for="f-start">Start command</label><input id="f-start" type="text" placeholder="./launch.sh start"></div>
+      <div><label for="f-stop">Stop command</label><input id="f-stop" type="text" placeholder="./launch.sh stop"></div>
+    </div>
+    <div class="field half">
+      <div><label for="f-host">Host</label><input id="f-host" type="text" value="192.168.20.63"></div>
+      <div><label for="f-port">Port</label><input id="f-port" type="number" inputmode="numeric"></div>
+    </div>
+    <div class="field half">
+      <div><label for="f-slot">Slot</label><input id="f-slot" type="text" placeholder="primary-llm"></div>
+      <div><label for="f-engine">Engine</label>
+        <select id="f-engine">
+          <option value="vllm">vllm</option>
+          <option value="tensorfold">tensorfold</option>
+          <option value="velogb10">velogb10</option>
+        </select>
+      </div>
+    </div>
+    <div class="field"><label for="f-containers">Containers (comma-separated)</label><input id="f-containers" type="text" placeholder="glm-r0, glm-r1"></div>
+    <div class="field"><label for="f-procmatch">Process match (optional)</label><input id="f-procmatch" type="text" placeholder="e.g. vllm serve"></div>
+    <div class="form-err" id="add-err"></div>
+    <div class="row" style="justify-content:flex-end">
+      <button class="btn" id="btn-cancel" type="button">Cancel</button>
+      <button class="btn primary" id="btn-register" type="button">Register</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Log slide-over ===== -->
+<div id="logpanel" role="dialog" aria-modal="true" aria-label="Container logs">
+  <header>
+    <h3 id="log-title" style="font-family:var(--mono); font-size:13px">logs</h3>
+    <span class="muted small" id="log-source"></span>
+    <div class="spacer"></div>
+    <button class="btn" id="btn-log-refresh" type="button">Refresh</button>
+    <button class="btn" id="btn-log-close" type="button">Close</button>
+  </header>
+  <pre id="log-pre">—</pre>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+'use strict';
+
+/* ============================ helpers ============================ */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const GiB = 1024 ** 3;
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined) continue;
+    if (k === 'class') n.className = v;
+    else if (k === 'text') n.textContent = v;
+    else if (k.startsWith('on') && typeof v === 'function') n.addEventListener(k.slice(2).toLowerCase(), v);
+    else n.setAttribute(k, v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid === null || kid === undefined || kid === false) continue;
+    n.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return n;
+}
+
+const fmtGiB = (b) => (b == null ? '—' : (b / GiB).toFixed(1));
+const fmtInt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+
+function fmtUptime(s) {
+  if (s == null) return '—';
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function truncMid(s, max = 44) {
+  if (!s) return '—';
+  if (s.length <= max) return s;
+  const half = Math.floor((max - 1) / 2);
+  return s.slice(0, half) + '…' + s.slice(s.length - half);
+}
+
+function useClass(pct) {
+  if (pct == null) return '';
+  if (pct > 92) return 'crit';
+  if (pct > 85) return 'warn';
+  return '';
+}
+
+/* ============================ toasts ============================ */
+
+function toast(msg, kind = 'ok') {
+  const t = el('div', { class: 'toast' + (kind === 'err' ? ' err' : ''), text: msg });
+  $('#toasts').append(t);
+  setTimeout(() => t.remove(), 4000);
+}
+
+/* ============================ api ============================ */
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  let body = null;
+  const text = await res.text();
+  if (text) { try { body = JSON.parse(text); } catch { /* non-JSON */ } }
+  if (!res.ok) {
+    const err = new Error((body && body.error) || `HTTP ${res.status}`);
+    err.payload = body;
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+/* ============================ state ============================ */
+
+let lastData = null;
+const busy = new Set();          // keys: "drop", "<id>:start", "<id>:stop", ...
+const lastNodes = { ai: null, ai2: null }; // keep last good per-node data for "unreachable" dimming
+let logTarget = null;            // entry id currently open in the log panel
+
+/* ============================ top banner ============================ */
+
+function checkDot(name, ok) {
+  return el('span', { class: 'check ' + (ok ? 'ok' : 'bad'), title: `${name}: ${ok ? 'ok' : 'FAIL'}` });
+}
+
+function bar(fillPct, ...extraClass) {
+  const cls = ['bar', ...extraClass].join(' ');
+  const fillCls = useClass(fillPct) || '';
+  return el('div', { class: cls },
+    el('i', { style: `width:${Math.max(0, Math.min(100, fillPct || 0))}%` , class: fillCls }));
+}
+
+function renderTop(st) {
+  const root = $('#topbar');
+  root.replaceChildren();
+
+  const online = !!(st && st.online);
+  let pill;
+  if (online) {
+    pill = el('span', { class: 'pill on' }, el('span', { class: 'dot' }), 'GFS2 /mnt/nvmeof: ONLINE');
+  } else {
+    const reason = (st && st.reason) ? ` — ${st.reason}` : '';
+    pill = el('span', { class: 'pill off', title: reason },
+      el('span', { class: 'dot' }), `GFS2 /mnt/nvmeof: OFFLINE${reason}`);
+  }
+
+  const checks = st && st.checks ? st.checks : {};
+  const checkRow = el('span', { class: 'row', style: 'gap:5px' },
+    checkDot('ai_mount', checks.ai_mount),
+    checkDot('ai_raid', checks.ai_raid),
+    checkDot('ai_stat', checks.ai_stat),
+    checkDot('ai2_mount', checks.ai2_mount),
+    checkDot('ai2_stat', checks.ai2_stat));
+
+  const raidOk = !!checks.ai_raid;
+  const raid = el('span', { class: 'pill ' + (raidOk ? 'on' : 'off'), title: 'RAID0 /dev/md0 health (ai_raid check)' },
+    el('span', { class: 'dot' }), 'RAID0 /dev/md0: ' + (raidOk ? 'HEALTHY' : 'DEGRADED'));
+
+  const left = el('div', { class: 'row' }, pill, checkRow, raid);
+
+  // capacity bar
+  const d = st && st.disk;
+  let capEl;
+  if (d && d.total_bytes) {
+    const pct = d.use_pct != null ? d.use_pct : (d.used_bytes / d.total_bytes) * 100;
+    capEl = el('div', { class: 'row', style: 'flex:1; min-width:260px; gap:8px' },
+      el('span', { class: 'muted small' }, 'Shared storage'),
+      bar(pct),
+      el('span', { class: 'small mono' },
+        `${fmtGiB(d.used_bytes)} / ${fmtGiB(d.total_bytes)} GiB `,
+        el('span', { class: 'pct ' + useClass(pct) }, `(${(pct || 0).toFixed(1)}%)`)));
+  } else {
+    capEl = el('span', { class: 'muted small' }, 'Shared storage: no data');
+  }
+
+  const dropBtn = el('button', {
+    class: 'btn' + (busy.has('drop') ? ' busy' : ''),
+    type: 'button',
+    onclick: dropCaches,
+  }, 'Drop Page Cache (ai + ai2)');
+  if (!online) { dropBtn.disabled = true; dropBtn.title = 'Storage offline'; }
+
+  root.append(el('div', { class: 'row' }, left, capEl, el('div', { class: 'spacer' }), dropBtn));
+}
+
+async function dropCaches() {
+  busy.add('drop');
+  renderAll(lastData);
+  try {
+    const r = await api('/api/cluster/drop-caches', { method: 'POST' });
+    toast('Page cache dropped on ai + ai2');
+  } catch (e) {
+    let snippet = '';
+    const p = e.payload || {};
+    for (const k of ['ai', 'ai2']) if (p[k]) snippet += `\n${k}: ${String(p[k]).slice(0, 200)}`;
+    toast(`drop-caches failed: ${e.message}${snippet}`, 'err');
+  } finally {
+    busy.delete('drop');
+    renderAll(lastData);
+  }
+}
+
+/* ============================ node cards ============================ */
+
+function nodeCard(name, role, cur, stale) {
+  const card = el('div', { class: 'card' + (stale ? ' unreachable' : ''), style: 'background:#0d1118' });
+  card.append(el('div', { class: 'row', style: 'margin-bottom:10px' },
+    el('h3', {}, `${name} — ${role}`),
+    el('div', { class: 'spacer' }),
+    stale ? el('span', { class: 'pill off' }, 'unreachable') : null));
+
+  if (!cur) {
+    card.append(el('div', { class: 'muted' }, 'no data'));
+    return card;
+  }
+
+  // unified memory
+  const memPct = cur.mem_total_bytes ? (cur.mem_used_bytes / cur.mem_total_bytes) * 100 : 0;
+  card.append(el('div', {},
+    el('div', { class: 'row', style: 'margin-bottom:2px' },
+      el('span', { class: 'muted small' }, 'Unified Memory'),
+      el('div', { class: 'spacer' }),
+      el('span', { class: 'big' }, fmtGiB(cur.mem_available_bytes)),
+      el('span', { class: 'muted small' }, 'GiB available')),
+    bar(memPct),
+    el('div', { class: 'stat-grid' },
+      el('div', { class: 'label' }, `Used: ${fmtGiB(cur.mem_used_bytes)} / ${fmtGiB(cur.mem_total_bytes)} GiB`),
+      el('div', { class: 'label' }, `Page Cache: ${fmtGiB(cur.mem_cache_bytes)} GiB`),
+      el('div', { class: 'label' },
+        `Swap Used: ${fmtGiB(cur.swap_used_bytes)}` +
+        (cur.swap_total_bytes ? ` / ${fmtGiB(cur.swap_total_bytes)} GiB` : '')))));
+
+  // local disk
+  const dk = cur.disk;
+  if (dk) {
+    card.append(el('div', { style: 'margin-top:12px' },
+      el('div', { class: 'row', style: 'margin-bottom:2px' },
+        el('span', { class: 'muted small' }, `Local Disk ${dk.mount || '/'}`),
+        el('div', { class: 'spacer' }),
+        el('span', { class: 'small pct ' + useClass(dk.use_pct) }, `${dk.use_pct != null ? dk.use_pct.toFixed(1) : '—'}%`)),
+      bar(dk.use_pct),
+      el('div', { class: 'stat-grid' },
+        el('div', { class: 'label' }, `Used: ${fmtGiB(dk.used_bytes)} / ${fmtGiB(dk.total_bytes)} GiB`),
+        el('div', { class: 'label' }, `Avail: ${fmtGiB(dk.avail_bytes)} GiB`))));
+  }
+  return card;
+}
+
+function renderNodes(nodes) {
+  const wrap = $('#nodes');
+  wrap.replaceChildren();
+
+  const ai = nodes && nodes.ai ? nodes.ai : null;
+  const ai2 = nodes && nodes.ai2 ? nodes.ai2 : null;
+
+  if (ai && ai.mem_total_bytes != null) lastNodes.ai = ai;
+  if (ai2 && ai2.mem_total_bytes != null) lastNodes.ai2 = ai2;
+
+  const aiStale = !ai || ai.mem_total_bytes == null;
+  const ai2Stale = !ai2 || ai2.mem_total_bytes == null;
+
+  wrap.append(nodeCard('ai', 'Head', aiStale ? lastNodes.ai : ai, aiStale));
+  wrap.append(nodeCard('ai2', 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale));
+}
+
+/* ============================ endpoint cards ============================ */
+
+function statusBadge(status) {
+  return el('span', { class: 'badge ' + status, text: status === 'STARTING' ? 'STARTING…' : status });
+}
+
+function epStat(label, ...vals) {
+  return el('div', {},
+    el('div', { class: 'label' }, label),
+    el('div', {}, ...vals));
+}
+
+function renderActive(entries) {
+  const wrap = $('#active');
+  wrap.replaceChildren();
+  const active = entries.filter((e) => e.status !== 'STOPPED');
+
+  if (!active.length) {
+    wrap.append(el('div', { class: 'muted' }, 'No active inference endpoints.'));
+    return;
+  }
+
+  for (const e of active) {
+    const t = e.telemetry || {};
+
+    // memory line
+    let memLine;
+    if (e.mem_total_bytes == null) {
+      memLine = el('span', { class: 'muted' }, '—');
+    } else {
+      const showSplit = e.mem_ai_bytes != null || e.mem_ai2_bytes != null;
+      memLine = el('span', {},
+        `${fmtGiB(e.mem_total_bytes)} GiB total`,
+        showSplit ? ` (ai: ${fmtGiB(e.mem_ai_bytes)} | ai2: ${fmtGiB(e.mem_ai2_bytes)})` : '');
+    }
+
+    // concurrency
+    const conc = t.concurrent_requests != null ? String(t.concurrent_requests) : '—';
+    const queued = t.queued_requests > 0 ? ` +${fmtInt(t.queued_requests)} queued` : '';
+
+    // speed
+    const live = t.live_tok_per_sec != null ? t.live_tok_per_sec.toFixed(1) : null;
+    const speedParts = [live != null ? `${live} tok/s live` : '— tok/s'];
+    if (t.lifetime_decode_tok_per_sec != null) {
+      speedParts.push(`${t.lifetime_decode_tok_per_sec.toFixed(1)} tok/s lifetime`);
+    }
+
+    // tokens
+    const tokBits = [el('span', {}, fmtInt(t.total_tokens_generated))];
+    if (t.prompt_tokens_total != null) {
+      tokBits.push(el('span', { class: 'muted' }, ` prompt: ${fmtInt(t.prompt_tokens_total)}`));
+    }
+    if (t.cached_tokens_total != null && t.prompt_tokens_total > 0) {
+      const hit = ((t.cached_tokens_total / t.prompt_tokens_total) * 100).toFixed(1);
+      tokBits.push(el('span', { class: 'muted' }, ` · cache-hit ${hit}%`));
+    }
+    if (e.engine === 'vllm' && t.http_requests_total != null) {
+      tokBits.push(el('span', { class: 'muted' }, ` · HTTP requests: ${fmtInt(t.http_requests_total)}`));
+    }
+
+    const stopBusy = busy.has(`${e.id}:stop`);
+    const card = el('div', { class: 'card ep-card', style: 'background:#0d1118' },
+      el('div', { class: 'row' },
+        el('h3', { class: 'mono' }, e.name),
+        el('div', { class: 'spacer' }),
+        e.status === 'STARTING' ? el('span', { class: 'badge STARTING' }, 'starting…') : null,
+        statusBadge(e.status)),
+      el('div', { class: 'muted small mono' },
+        `serving: ${e.served_model || e.name} · ${e.host}:${e.port} · up ${fmtUptime(e.uptime_s)}`),
+      el('div', { class: 'ep-stats' },
+        epStat('Memory Used', memLine),
+        epStat('Concurrent Requests', el('span', {}, conc, queued ? el('span', { class: 'muted' }, queued) : null)),
+        epStat('Avg Speed', el('span', {}, speedParts.join(' · '))),
+        epStat('Total Tokens Generated', ...tokBits)),
+      el('div', { class: 'row', style: 'justify-content:flex-end' },
+        el('button', { class: 'btn', type: 'button', onclick: () => openLogs(e.id, e.name) }, 'Logs'),
+        el('button', {
+          class: 'btn danger' + (stopBusy ? ' busy' : ''), type: 'button',
+          onclick: () => stopEntry(e.id, e.name),
+        }, 'Stop')));
+    wrap.append(card);
+  }
+}
+
+/* ============================ registry table ============================ */
+
+function actionBtn(id, key, label, cls, title, onClick) {
+  const isBusy = busy.has(`${id}:${key}`);
+  const b = el('button', {
+    class: `btn ${cls || ''}` + (isBusy ? ' busy' : ''),
+    type: 'button',
+    onclick: () => onClick(id),
+  }, label);
+  if (title) b.title = title;
+  return b;
+}
+
+function renderTable(entries, storage) {
+  const body = $('#regbody');
+  body.replaceChildren();
+  const offline = !(storage && storage.online);
+  const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const e of sorted) {
+    const startDisabled = e.status === 'RUNNING' || busy.has(`${e.id}:start`);
+    const tr = el('tr', {},
+      el('td', { class: 'mono' }, e.name),
+      el('td', { class: 'muted mono', title: e.path }, truncMid(e.path)),
+      el('td', {}, e.slot || '—'),
+      el('td', { class: 'mono' }, String(e.port)),
+      el('td', { class: 'mono' }, e.engine || '—'),
+      el('td', {}, statusBadge(e.status)),
+      el('td', { class: 'acts' },
+        (e.status !== 'RUNNING')
+          ? actionBtn(e.id, 'start', 'Start', '', offline ? 'Storage offline' : '', (id) => startEntry(id))
+          : null,
+        (e.status === 'RUNNING' || e.status === 'STARTING')
+          ? actionBtn(e.id, 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name))
+          : null,
+        actionBtn(e.id, 'logs', 'Logs', '', '', (id) => openLogs(id, e.name)),
+        actionBtn(e.id, 'remove', 'Remove', 'danger', '', (id) => removeEntry(id, e.name))));
+
+    const startBtn = tr.querySelector('td.acts .btn');
+    if (startDisabled && startBtn && startBtn.textContent === 'Start') {
+      startBtn.disabled = true;
+      if (!offline) startBtn.title = 'starting…';
+    }
+    body.append(tr);
+  }
+  if (!sorted.length) {
+    body.append(el('tr', {}, el('td', { colspan: '7', class: 'muted', style: 'text-align:center; padding:20px' },
+      'No repos registered. Click “+ Add Repo / Launcher” to register one.')));
+  }
+}
+
+async function startEntry(id) {
+  busy.add(`${id}:start`);
+  renderAll(lastData);
+  try {
+    await api(`/api/entries/${encodeURIComponent(id)}/start`, { method: 'POST' });
+    toast(`Start requested for ${id}`);
+  } catch (e) {
+    if (e.status === 409) toast(`Cannot start ${id}: ${e.message}`, 'err');
+    else toast(`Start failed for ${id}: ${e.message}`, 'err');
+  } finally {
+    busy.delete(`${id}:start`);
+    renderAll(lastData);
+  }
+}
+
+async function stopEntry(id, name) {
+  if (!confirm(`Stop ${name || id}?`)) return;
+  busy.add(`${id}:stop`);
+  renderAll(lastData);
+  try {
+    await api(`/api/entries/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+    toast(`${name || id} stop requested`);
+  } catch (e) {
+    toast(`Stop failed for ${name || id}: ${e.message}`, 'err');
+  } finally {
+    busy.delete(`${id}:stop`);
+    renderAll(lastData);
+  }
+}
+
+async function removeEntry(id, name) {
+  if (!confirm(`Remove ${name || id} from the registry? (containers are not stopped)`)) return;
+  busy.add(`${id}:remove`);
+  try {
+    await api(`/api/entries/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    toast(`${name || id} removed`);
+  } catch (e) {
+    toast(`Remove failed for ${name || id}: ${e.message}`, 'err');
+  } finally {
+    busy.delete(`${id}:remove`);
+  }
+}
+
+/* ============================ add modal ============================ */
+
+const addOverlay = $('#addoverlay');
+
+function openAdd() {
+  $('#add-err').textContent = '';
+  addOverlay.classList.add('open');
+  $('#f-path').focus();
+}
+
+function closeAdd() {
+  addOverlay.classList.remove('open');
+}
+
+function addFormBody() {
+  return {
+    name: $('#f-name').value.trim(),
+    path: $('#f-path').value.trim(),
+    start_cmd: $('#f-start').value.trim(),
+    stop_cmd: $('#f-stop').value.trim(),
+    host: $('#f-host').value.trim(),
+    port: parseInt($('#f-port').value, 10) || 0,
+    slot: $('#f-slot').value.trim() || null,
+    engine: $('#f-engine').value,
+    containers: $('#f-containers').value.split(',').map((s) => s.trim()).filter(Boolean),
+    process_match: $('#f-procmatch').value.trim() || null,
+  };
+}
+
+async function autoDetect() {
+  const path = $('#f-path').value.trim();
+  const errEl = $('#add-err');
+  errEl.textContent = '';
+  if (!path) { errEl.textContent = 'Enter a repo path first.'; return; }
+
+  const btn = $('#btn-inspect');
+  btn.classList.add('busy');
+  try {
+    const r = await api('/api/entries/inspect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    const s = r && r.suggestion;
+    if (!s) { errEl.textContent = 'Auto-detect returned no suggestion.'; return; }
+    $('#f-name').value = s.name || '';
+    $('#f-start').value = s.start_cmd || '';
+    $('#f-stop').value = s.stop_cmd || '';
+    $('#f-host').value = s.host || '192.168.20.63';
+    if (s.port != null) $('#f-port').value = s.port;
+    $('#f-slot').value = s.slot || '';
+    if (s.engine) $('#f-engine').value = s.engine;
+    $('#f-containers').value = Array.isArray(s.containers) ? s.containers.join(', ') : '';
+    $('#f-procmatch').value = s.process_match || '';
+    toast('Auto-detect complete — review fields and register.', 'ok');
+  } catch (e) {
+    errEl.textContent = `Auto-detect failed: ${e.message}`;
+  } finally {
+    btn.classList.remove('busy');
+  }
+}
+
+async function register() {
+  const errEl = $('#add-err');
+  errEl.textContent = '';
+  const body = addFormBody();
+  if (!body.name || !body.path) { errEl.textContent = 'Name and path are required.'; return; }
+
+  const btn = $('#btn-register');
+  btn.classList.add('busy');
+  try {
+    await api('/api/entries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    closeAdd();
+    toast(`Registered ${body.name}`);
+  } catch (e) {
+    errEl.textContent = `Register failed${e.status === 409 ? ' (already registered)' : ''}: ${e.message}`;
+  } finally {
+    btn.classList.remove('busy');
+  }
+}
+
+/* ============================ log slide-over ============================ */
+
+const logPanel = $('#logpanel');
+
+function setLogBusy(on) {
+  const b = $('#btn-log-refresh');
+  b.classList.toggle('busy', on);
+  b.disabled = on;
+}
+
+async function fetchLogs() {
+  if (!logTarget) return;
+  setLogBusy(true);
+  try {
+    const r = await api(`/api/entries/${encodeURIComponent(logTarget)}/logs`);
+    $('#log-source').textContent = `source: ${r.source || 'unknown'}`;
+    $('#log-pre').textContent = (r.lines && r.lines.length) ? r.lines.join('\n') : '(no log lines)';
+    $('#log-pre').scrollTop = 0;
+  } catch (e) {
+    $('#log-pre').textContent = `failed to fetch logs: ${e.message}`;
+  } finally {
+    setLogBusy(false);
+  }
+}
+
+function openLogs(id, name) {
+  logTarget = id;
+  $('#log-title').textContent = `logs — ${name || id}`;
+  $('#log-source').textContent = 'source: …';
+  $('#log-pre').textContent = 'loading…';
+  logPanel.classList.add('open');
+  fetchLogs();
+}
+
+function closeLogs() {
+  logPanel.classList.remove('open');
+  logTarget = null;
+}
+
+/* ============================ orchestration ============================ */
+
+function renderAll(data) {
+  if (!data) return;
+  renderTop(data.storage);
+  renderNodes(data.nodes);
+  renderActive(data.entries || []);
+  renderTable(data.entries || [], data.storage);
+}
+
+async function poll() {
+  try {
+    const data = await api('/api/state');
+    lastData = data;
+    $('#errbanner').classList.remove('show');
+    renderAll(data);
+  } catch {
+    $('#errbanner').classList.add('show');
+  } finally {
+    setTimeout(poll, 2000);
+  }
+}
+
+/* ============================ wiring ============================ */
+
+$('#btn-add').addEventListener('click', openAdd);
+$('#btn-cancel').addEventListener('click', closeAdd);
+$('#btn-inspect').addEventListener('click', autoDetect);
+$('#btn-register').addEventListener('click', register);
+$('#btn-log-refresh').addEventListener('click', fetchLogs);
+$('#btn-log-close').addEventListener('click', closeLogs);
+addOverlay.addEventListener('click', (ev) => { if (ev.target === addOverlay) closeAdd(); });
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape') {
+    if (addOverlay.classList.contains('open')) closeAdd();
+    if (logPanel.classList.contains('open')) closeLogs();
+  }
+});
+
+poll();
+</script>
+</body>
+</html>

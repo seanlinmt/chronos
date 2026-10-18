@@ -1,0 +1,19 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Runtime data and logs
+/data/
+/logs/
+*.log
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor artifacts
+*.swp
+*.swo
+.vscode/
+.idea/
