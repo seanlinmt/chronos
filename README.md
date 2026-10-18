@@ -24,8 +24,8 @@ chronos/
 **TUI** — 4-zone ratatui dashboard: top status bar with GFS2 badge, dual-node memory/disk gauges, active-endpoint telemetry, registry table. Keys: `j/k` select · `s` start · `x` stop (`y/n`) · `l` logs · `a` add (auto-detects `launch.sh`/`start-*.sh`/`launch_*.sh` + `.env*`) · `d` remove · `c` drop caches · `r` refresh · `q` quit (leaves servers running).
 
 ```bash
-chronos-tui
-chronos-tui --dump-state | jq .   # headless JSON snapshot, exit 0
+chronos
+chronos --dump-state | jq .   # headless JSON snapshot, exit 0
 ```
 
 **Web** — dark single-page UI served at `http://ai:8090/` with the same data over `/api/*` (list/add/remove/start/stop/logs/drop-caches). Runs as a systemd user service (`chronos-http.service`, linger enabled).

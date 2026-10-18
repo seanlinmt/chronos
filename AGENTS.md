@@ -20,7 +20,7 @@
    ssh ai 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/chronos && nohup cargo build --release > build.log 2>&1 & echo started'
    ```
 4. Check `build.log` until `Finished`; on errors, fix here, re-scp, rebuild.
-5. TUI: no restart needed; expose via `~/.local/bin/chronos-tui` symlink (already exists; also `spark-deck` → same binary as transitional alias). HTTP: `ssh ai 'systemctl --user restart chronos-http'`.
+5. TUI: no restart needed; expose via `~/.local/bin/chronos` symlink (points at `~/chronos/target/release/chronos-tui`). HTTP: `ssh ai 'systemctl --user restart chronos-http'`.
 6. Verify — **both** gates below.
 
 ## SSH gotcha
