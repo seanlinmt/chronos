@@ -9,7 +9,7 @@
 - Cargo workspace, three crates:
   - `crates/core` — ALL domain logic (registry, storage gatekeeper, GB10 per-PID GPU attribution, 3-engine probes, snapshot assembly, detached lifecycle). One source of truth; domain fixes land here once.
   - `crates/tui` — `chronos-tui` bin: ratatui dashboard + `--dump-state` JSON mode. UI/keys only; domain via core.
-  - `crates/http` — `chronos-http` bin: axum on `:8090` + `static/index.html` (embedded, `include_str!`). The adapter maps core snapshot → the exact `/api/state` key set the web UI reads. **Do not change the shape** without diffing against the JS in `static/index.html`.
+  - `crates/http` — `chronos-http` bin: axum on `:8090` + `static/index.html` (embedded, `include_str!`). Runs as **system-scope** systemd unit on `ai`: `/etc/systemd/system/chronos-http.service` (`sudo systemctl restart chronos-http`). The adapter maps core snapshot → the exact `/api/state` key set the web UI reads. **Do not change the shape** without diffing against the JS in `static/index.html`.
 
 ## Deployment flow (required order)
 
@@ -20,7 +20,7 @@
    ssh ai 'export PATH="$HOME/.cargo/bin:$PATH"; cd ~/chronos && nohup cargo build --release > build.log 2>&1 & echo started'
    ```
 4. Check `build.log` until `Finished`; on errors, fix here, re-scp, rebuild.
-5. TUI: no restart needed; expose via `~/.local/bin/chronos` symlink (points at `~/chronos/target/release/chronos-tui`). HTTP: `ssh ai 'systemctl --user restart chronos-http'`.
+5. TUI: no restart needed; expose via `~/.local/bin/chronos` symlink (points at `~/chronos/target/release/chronos-tui`). HTTP: `ssh ai 'sudo systemctl restart chronos-http'`.
 6. Verify — **both** gates below.
 
 ## SSH gotcha
@@ -62,6 +62,6 @@ ssh ai 'cd ~/chronos && ./target/release/chronos-tui --dump-state | jq .'
 ssh ai 'curl -s http://127.0.0.1:8090/api/state | jq ".entries[] | {id, status, served_model, mem_total_bytes}"'
 curl -s -o /dev/null -w "%{http_code}" http://192.168.20.63:8090/   # 200, ~32KB page
 ```
-- Same statuses as Gate 1; entry objects carry all 18 keys incl. `telemetry.*` (see the adapter in `crates/http/src/main.rs`); `journalctl --user -u chronos-http` shows no errors.
+- Same statuses as Gate 1; entry objects carry all 18 keys incl. `telemetry.*` (see the adapter in `crates/http/src/main.rs`); `journalctl -u chronos-http` shows no errors.
 
 Local Mac runs show null `/proc`-derived fields — expected; runtime metrics are only real on `ai`. Rebuilding does **not** update an already-running TUI session — the user must quit (`q`) and relaunch.
