@@ -7,6 +7,9 @@
 /logs/
 *.log
 
+# Plans working files
+plans/api-state-before.json
+
 # macOS
 .DS_Store
 .AppleDouble
