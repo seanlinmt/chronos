@@ -188,6 +188,7 @@ name = "chronos-http"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chronos-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -198,12 +199,9 @@ dependencies = [
 name = "chronos-tui"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "chronos-core",
  "crossterm",
  "ratatui",
- "reqwest",
- "serde",
  "serde_json",
  "tokio",
 ]
