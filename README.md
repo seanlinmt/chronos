@@ -10,6 +10,8 @@ chronos/
 └── crates/http   — chronos-http: axum web dashboard (:8090) + embedded UI
 ```
 
+![Chronos Dashboard](assets/dashboard.png)
+
 ## What it does
 
 - **Storage gatekeeper** — verifies `/mnt/nvmeof` (GFS2 over NVMe-oF RAID0 `md0`, repos/huggingface paths) on both nodes with 2s per-check timeouts; a hung DLM lock never freezes either frontend. Blocks start/add while offline.
