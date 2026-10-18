@@ -20,3 +20,4 @@ plans/api-state-before.json
 *.swo
 .vscode/
 .idea/
+.archify/
