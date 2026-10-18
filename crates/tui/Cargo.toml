@@ -1,0 +1,20 @@
+[package]
+name = "chronos-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ratatui TUI cluster-control / telemetry dashboard for the 2-node DGX Spark (GB10) cluster"
+
+[[bin]]
+name = "chronos-tui"
+path = "src/main.rs"
+
+[dependencies]
+chronos-core = { path = "../core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
