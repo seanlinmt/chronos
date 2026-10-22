@@ -67,18 +67,20 @@ fn slugify(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
     for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            out.push(c);
             last_dash = false;
         } else if !last_dash && !out.is_empty() {
             out.push('-');
             last_dash = true;
         }
     }
-    while out.ends_with('-') {
+    while out.ends_with('-') || out.ends_with('.') || out.ends_with('_') {
         out.pop();
     }
-    out
+    // Also strip leading dots/dashes/underscores to avoid hidden or traversal ids
+    let trimmed = out.trim_start_matches(|c| c == '.' || c == '-' || c == '_');
+    trimmed.to_string()
 }
 
 fn basename(p: &str) -> &str {
@@ -898,5 +900,19 @@ async fn main() {
             eprintln!("failed to bind {bind}: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slugify_allows_dots_and_preserves_case() {
+        assert_eq!(slugify("DeepSeek-v4.1-Flash"), "DeepSeek-v4.1-Flash");
+        assert_eq!(slugify("model.v2.0_test"), "model.v2.0_test");
+        assert_eq!(slugify("...my.repo..."), "my.repo");
+        assert_eq!(slugify("My Cool Repo (v1.2)"), "My-Cool-Repo-v1.2");
+        assert_eq!(slugify("---test---"), "test");
     }
 }
