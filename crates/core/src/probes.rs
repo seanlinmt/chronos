@@ -217,27 +217,117 @@ async fn probe_tensorfold(
         return fail_probe("health ok=false".into());
     }
     let live_obj = v.get("live");
-    let total = jnum(&v, "completion_tokens_total");
-    let decode = jf(&v, "decode_seconds_total");
+
+    // 3. Prometheus metrics from /metrics (best-effort; supplies counters if /health lacks them).
+    let mut metrics_req = client.get(format!("{url}/metrics"));
+    if let Some(k) = api_key.as_deref() {
+        metrics_req = metrics_req.header("Authorization", format!("Bearer {k}"));
+    }
+    let metrics: Option<String> = match metrics_req.send().await {
+        Ok(r) if r.status().is_success() => r.text().await.ok(),
+        _ => None,
+    };
+
+    let prom_total = metrics.as_deref().and_then(|txt| {
+        find_prom_metric(
+            txt,
+            &[
+                "tensorfold:generation_tokens_total",
+                "tensorfold:completion_tokens_total",
+                "tensorfold_generation_tokens_total",
+                "tensorfold_completion_tokens_total",
+                "vllm:generation_tokens_total",
+                "generation_tokens_total",
+                "completion_tokens_total",
+            ],
+        )
+    }).map(|f| f as u64);
+
+    let prom_prompt = metrics.as_deref().and_then(|txt| {
+        find_prom_metric(
+            txt,
+            &[
+                "tensorfold:prompt_tokens_total",
+                "tensorfold_prompt_tokens_total",
+                "vllm:prompt_tokens_total",
+                "prompt_tokens_total",
+            ],
+        )
+    }).map(|f| f as u64);
+
+    let prom_decode = metrics.as_deref().and_then(|txt| {
+        find_prom_metric(
+            txt,
+            &[
+                "tensorfold:request_decode_seconds_sum",
+                "tensorfold:request_decode_time_seconds_sum",
+                "tensorfold_request_decode_seconds_sum",
+                "decode_seconds_total",
+            ],
+        )
+    });
+
+    let total = jnum(&v, "completion_tokens_total")
+        .or_else(|| jnum(&v, "generation_tokens_total"))
+        .or(prom_total);
+    let decode = jf(&v, "decode_seconds_total").or(prom_decode);
+
+    let prom_concurrent = metrics.as_deref().and_then(|txt| {
+        find_prom_metric(
+            txt,
+            &[
+                "tensorfold:requests_running",
+                "tensorfold:num_requests_running",
+                "vllm:num_requests_running",
+            ],
+        )
+    }).map(|f| f as u64);
+
+    let prom_queued = metrics.as_deref().and_then(|txt| {
+        find_prom_metric(
+            txt,
+            &[
+                "tensorfold:requests_waiting",
+                "tensorfold:num_requests_waiting",
+                "vllm:num_requests_waiting",
+            ],
+        )
+    }).map(|f| f as u64);
+
     let concurrent = jnum(&v, "requests_running")
         .or_else(|| jnum(&v, "inflight"))
-        .or_else(|| live_obj.and_then(|l| jnum(l, "connections")));
+        .or_else(|| live_obj.and_then(|l| jnum(l, "connections")))
+        .or(prom_concurrent);
     let queued = jnum(&v, "queued")
-        .or_else(|| live_obj.and_then(|l| jnum(l, "waiting")));
-    let live = match (prev.total, total, prev.decode_s, decode) {
-        (Some(pt), Some(nt), Some(pd), Some(nd)) if nd > pd => Some((nt - pt) as f64 / (nd - pd)),
-        (Some(_), Some(_), _, _) => Some(0.0),
-        _ => live_obj.and_then(|l| jf(l, "decode_tokens_per_second")),
-    };
+        .or_else(|| live_obj.and_then(|l| jnum(l, "waiting")))
+        .or(prom_queued);
+
+    let live = live_obj
+        .and_then(|l| jf(l, "decode_tokens_per_second"))
+        .or_else(|| match (prev.total, total, prev.decode_s, decode) {
+            (Some(pt), Some(nt), Some(pd), Some(nd)) if nd > pd => {
+                Some((nt - pt) as f64 / (nd - pd))
+            }
+            (Some(pt), Some(nt), _, _) if nt > pt => {
+                let dt = prev.at.map(|a| now.duration_since(a).as_secs_f64()).unwrap_or(0.0);
+                if dt > 0.0 {
+                    Some((nt - pt) as f64 / dt)
+                } else {
+                    None
+                }
+            }
+            (Some(_), Some(_), _, _) => Some(0.0),
+            _ => None,
+        });
+
     let lifetime = match (total, decode) {
         (Some(t), Some(d)) if d > 0.0 => Some(t as f64 / d),
         _ => None,
     };
-    let p = std::mem::take(prev);
     *prev = Prev {
         total,
         decode_s: decode,
-        at: if p.at.is_some() { p.at } else { Some(now) },
+        at: Some(now),
     };
     let served = served.or_else(|| v.get("model").and_then(|x| x.as_str()).map(|s| s.to_string()));
     ProbeResult {
@@ -249,22 +339,39 @@ async fn probe_tensorfold(
         live_tok_per_sec: live,
         lifetime_decode: lifetime,
         total_tokens: total,
-        prompt_tokens: jnum(&v, "prompt_tokens_total"),
+        prompt_tokens: jnum(&v, "prompt_tokens_total").or(prom_prompt),
         cached_tokens: jnum(&v, "cached_tokens_total"),
     }
 }
 
-fn parse_prom_metric(text: &str, key: &str) -> Option<f64> {
+pub fn parse_prom_metric(text: &str, key: &str) -> Option<f64> {
     text.lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .find_map(|l| {
-            let mut it = l.split_whitespace();
-            if it.next() == Some(key) {
-                it.next().and_then(|v| v.parse().ok())
-            } else {
-                None
+            let trimmed = l.trim();
+            if !trimmed.starts_with(key) {
+                return None;
             }
+            let rest = &trimmed[key.len()..];
+            let after_name = if let Some(stripped) = rest.strip_prefix('{') {
+                let close_idx = stripped.find('}')?;
+                &stripped[close_idx + 1..]
+            } else if rest.is_empty() || rest.chars().next()?.is_whitespace() {
+                rest
+            } else {
+                return None;
+            };
+            after_name.split_whitespace().next().and_then(|v| v.parse().ok())
         })
+}
+
+pub fn find_prom_metric(text: &str, keys: &[&str]) -> Option<f64> {
+    for k in keys {
+        if let Some(v) = parse_prom_metric(text, k) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 pub async fn probe_vllm(e: &RegistryEntry, url: &str, prev: &mut Prev, client: &reqwest::Client) -> ProbeResult {
@@ -288,15 +395,16 @@ pub async fn probe_vllm(e: &RegistryEntry, url: &str, prev: &mut Prev, client: &
         Ok(r) if r.status().is_success() => r.text().await.ok(),
         _ => None,
     };
-    let (concurrent, queued, total) = match &metrics {
+    let (concurrent, queued, total, prompt) = match &metrics {
         Some(txt) => {
-            let run = parse_prom_metric(txt, "vllm:num_requests_running").map(|f| f as u64);
-            let wait = parse_prom_metric(txt, "vllm:num_requests_waiting").map(|f| f as u64);
-            let tot = parse_prom_metric(txt, "vllm:generation_tokens_total").map(|f| f as u64);
+            let run = find_prom_metric(txt, &["vllm:num_requests_running", "num_requests_running"]).map(|f| f as u64);
+            let wait = find_prom_metric(txt, &["vllm:num_requests_waiting", "num_requests_waiting"]).map(|f| f as u64);
+            let tot = find_prom_metric(txt, &["vllm:generation_tokens_total", "generation_tokens_total"]).map(|f| f as u64);
+            let prm = find_prom_metric(txt, &["vllm:prompt_tokens_total", "prompt_tokens_total"]).map(|f| f as u64);
             let fallback_conc = if txt.contains("http_requests_total") { Some(0) } else { None };
-            (run.or(fallback_conc), wait, tot)
+            (run.or(fallback_conc), wait, tot, prm)
         }
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     let live = match (prev.total, total) {
         (Some(pt), Some(nt)) if nt > pt => {
@@ -327,7 +435,7 @@ pub async fn probe_vllm(e: &RegistryEntry, url: &str, prev: &mut Prev, client: &
         live_tok_per_sec: live,
         lifetime_decode: None,
         total_tokens: total,
-        prompt_tokens: None,
+        prompt_tokens: prompt,
         cached_tokens: None,
     }
 }
@@ -579,5 +687,33 @@ mod tests {
         );
         let models = vec!["GLM-5.3-Flash-EXL3".to_string()];
         assert!(!model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_parse_prom_metric() {
+        let sample = "\
+# HELP tensorfold:generation_tokens_total Generated tokens of finished requests.
+# TYPE tensorfold:generation_tokens_total counter
+tensorfold:generation_tokens_total 18836
+# HELP vllm:prompt_tokens_total Number of prompt tokens processed.
+vllm:prompt_tokens_total{model_name=\"deepseek\"} 732007.5
+tensorfold:generation_tokens_total_extra 99999
+";
+        assert_eq!(
+            parse_prom_metric(sample, "tensorfold:generation_tokens_total"),
+            Some(18836.0)
+        );
+        assert_eq!(
+            parse_prom_metric(sample, "vllm:prompt_tokens_total"),
+            Some(732007.5)
+        );
+        assert_eq!(
+            parse_prom_metric(sample, "non_existent"),
+            None
+        );
+        assert_eq!(
+            find_prom_metric(sample, &["missing", "tensorfold:generation_tokens_total"]),
+            Some(18836.0)
+        );
     }
 }
