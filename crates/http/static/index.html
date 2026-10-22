@@ -25,7 +25,7 @@
     font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     padding: 20px;
   }
-  main { max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; }
+  main { max-width: 1400px; margin: 0 auto; display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
 
   .card {
     background: var(--card);
@@ -102,6 +102,26 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* ---- inline icons ---- */
+  /* Stroke presentation lives on .ic and inherits into the <use> shadow tree,
+     so the sprite symbols stay bare geometry. */
+  .svg-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+  .ic {
+    display: block; flex: none;
+    fill: none; stroke: currentColor;
+    stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .btn.icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; padding: 0;
+  }
+  /* Busy spinner replaces the glyph instead of sitting beside it, so an
+     icon button never changes width mid-request. */
+  .btn.icon.busy { position: relative; }
+  .btn.icon.busy .ic { opacity: 0; }
+  .btn.icon.busy::before { position: absolute; inset: 0; margin: auto; }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
   /* ---- table ---- */
   .tbl-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -109,7 +129,7 @@
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
   tbody tr:hover { background: rgba(79,156,249,.05); }
   td.acts { white-space: nowrap; }
-  td.acts .btn { margin-right: 4px; min-width: 78px; }
+  td.acts .btn { margin-right: 4px; }
   /* Reserve the slot of inapplicable buttons so the column never reflows
      when status changes (STOPPED→STARTING→RUNNING). */
   td.acts .btn.ghosted { visibility: hidden; }
@@ -169,6 +189,41 @@
   .field .half { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .form-err { color: var(--red); font-size: 12.5px; min-height: 18px; margin: 6px 0; }
 
+  /* ---- folder browser (reuses .overlay / .modal) ---- */
+  .fs-bar { gap: 8px; flex-wrap: nowrap; align-items: center; margin-bottom: 10px; }
+  .fs-crumbs {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    background: #0d1118; border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-family: var(--mono); font-size: 12px; color: #b7c2d8;
+  }
+  .fs-list {
+    list-style: none; margin: 0; padding: 4px;
+    height: 44vh; min-height: 190px; max-height: 340px; overflow-y: auto;
+    background: #0a0d13; border: 1px solid var(--border); border-radius: 8px;
+    outline: none;
+  }
+  .fs-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  }
+  .fs-item .name {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: var(--mono); font-size: 12px;
+  }
+  .fs-item .size { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+  .fs-item:hover { background: rgba(79,156,249,.07); }
+  .fs-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .fs-item[aria-selected="true"] { background: rgba(79,156,249,.16); }
+  .fs-item[aria-selected="true"] .name { color: #fff; }
+  .fs-item.dir .ic { color: var(--accent); }
+  .fs-item.file { color: var(--muted); cursor: default; }
+  .fs-item.file:hover { background: transparent; }
+  .fs-item.file .ic { opacity: .5; }
+  .fs-empty { padding: 20px 10px; text-align: center; color: var(--muted); font-size: 12.5px; }
+  .fs-errrow { gap: 8px; align-items: center; }
+  .fs-errrow .form-err { flex: 1; margin: 0; }
+  [hidden] { display: none !important; }
+
   /* ---- log slide-over ---- */
   #logpanel {
     position: fixed; top: 0; right: 0; height: 100vh; z-index: 250;
@@ -189,13 +244,87 @@
     white-space: pre-wrap; word-break: break-all;
   }
 
+  /* ---- thermal & load ---- */
+  .thermal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 900px) { .thermal-grid { grid-template-columns: 1fr; } }
+  .readouts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 14px; margin: 10px 0 12px; }
+  .readouts .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+  .readouts .value { font-family: var(--mono); font-size: 20px; font-weight: 700; line-height: 1.3; color: var(--text); }
+  .readouts .value.warn { color: var(--amber); }
+  .readouts .value.crit { color: var(--red); }
+  .readouts .unit { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-left: 2px; }
+  .thermal-chart { display: block; width: 100%; height: 190px; background: #0a0d13; border: 1px solid var(--border); border-radius: 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--muted); }
+  .legend .key { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch { width: 14px; height: 3px; border-radius: 2px; }
+  .seg { display: inline-flex; gap: 4px; }
+  .seg .btn { padding: 4px 9px; }
+
   @media (max-width: 640px) {
     body { padding: 12px; }
     .stat-grid, .ep-stats, .ep-hero { grid-template-columns: 1fr; }
+    .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
+    .readouts .value { font-size: 17px; }
   }
 </style>
 </head>
 <body>
+
+<!-- ===== inline icon sprite (embedded page: no external assets allowed) =====
+     Geometric stroke symbols on a 24×24 grid. Colour/stroke come from .ic. -->
+<svg class="svg-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+  <symbol id="ic-folder" viewBox="0 0 24 24">
+    <path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h3l2 2.5h6A2.5 2.5 0 0 1 20 9v8.5A2.5 2.5 0 0 1 17.5 20h-11A2.5 2.5 0 0 1 4 17.5z"/>
+  </symbol>
+  <symbol id="ic-file" viewBox="0 0 24 24">
+    <path d="M14 4H7.5A1.5 1.5 0 0 0 6 5.5v13A1.5 1.5 0 0 0 7.5 20h9a1.5 1.5 0 0 0 1.5-1.5V8z"/>
+    <path d="M14 4v4h4"/>
+  </symbol>
+  <symbol id="ic-up" viewBox="0 0 24 24">
+    <path d="M12 19V5"/>
+    <path d="M6 11l6-6 6 6"/>
+  </symbol>
+  <symbol id="ic-close" viewBox="0 0 24 24">
+    <path d="M6 6l12 12"/>
+    <path d="M18 6L6 18"/>
+  </symbol>
+  <symbol id="ic-check" viewBox="0 0 24 24">
+    <path d="M4.5 12.5l5 5L19.5 6.5"/>
+  </symbol>
+  <symbol id="ic-plus" viewBox="0 0 24 24">
+    <path d="M12 5v14"/>
+    <path d="M5 12h14"/>
+  </symbol>
+  <symbol id="ic-refresh" viewBox="0 0 24 24">
+    <path d="M20.5 12a8.5 8.5 0 1 1-2.9-6.4"/>
+    <path d="M20.5 4.5v5h-5"/>
+  </symbol>
+  <symbol id="ic-play" viewBox="0 0 24 24">
+    <path d="M8 5.5l10.5 6.5L8 18.5z"/>
+  </symbol>
+  <symbol id="ic-stop" viewBox="0 0 24 24">
+    <rect x="7" y="7" width="10" height="10" rx="2"/>
+  </symbol>
+  <symbol id="ic-edit" viewBox="0 0 24 24">
+    <path d="M4 20h4L19.5 8.5a2.5 2.5 0 0 0-3.5-3.5L4.5 16.5z"/>
+    <path d="M14.5 6.5l3.5 3.5"/>
+  </symbol>
+  <symbol id="ic-logs" viewBox="0 0 24 24">
+    <rect x="3" y="4.5" width="18" height="15" rx="2.5"/>
+    <path d="M7.5 9.5l2.5 2.5-2.5 2.5"/>
+    <path d="M13 14.5h4"/>
+  </symbol>
+  <symbol id="ic-trash" viewBox="0 0 24 24">
+    <path d="M4.5 7h15"/>
+    <path d="M9.5 7V5.5A1.5 1.5 0 0 1 11 4h2a1.5 1.5 0 0 1 1.5 1.5V7"/>
+    <path d="M6.8 7l.8 11.2A2 2 0 0 0 9.6 20h4.8a2 2 0 0 0 2-1.8L17.2 7"/>
+  </symbol>
+  <symbol id="ic-flush" viewBox="0 0 24 24">
+    <path d="M12 4.5v9.5"/>
+    <path d="M8 10.5l4 4 4-4"/>
+    <path d="M4.5 19h15"/>
+  </symbol>
+</svg>
 
 <div id="errbanner">connection lost, retrying…</div>
 
@@ -208,6 +337,20 @@
   </section>
 
   <section class="card">
+    <div class="row" style="margin-bottom:12px">
+      <h2 style="margin:0">Thermal &amp; Load</h2>
+      <div class="spacer"></div>
+      <div class="seg" id="thermal-window" role="group" aria-label="Chart time window">
+        <button class="btn" type="button" data-window="300" aria-pressed="false">5m</button>
+        <button class="btn primary" type="button" data-window="900" aria-pressed="true">15m</button>
+        <button class="btn" type="button" data-window="1800" aria-pressed="false">30m</button>
+      </div>
+    </div>
+    <div class="thermal-grid" id="thermal"></div>
+    <p class="muted small" style="margin:12px 0 0">CPU/SoC is the hottest ACPI thermal zone the node reports, not a per-core sensor. Fan and RAM temperatures are not exposed on GB10, so they are not charted. Temperatures read against the left °C axis, both loads against the right % axis. Readouts turn amber or red above the thresholds — GPU 80/90&nbsp;°C, CPU/SoC 90/95&nbsp;°C, CPU load 85% — with one exception: GPU load stays neutral, because a node sitting at 100% while it serves is normal. History is held in this browser tab only — 2&nbsp;s samples, 30&nbsp;min max, lost on reload.</p>
+  </section>
+
+  <section class="card">
     <h2>Active Inference Endpoints</h2>
     <div class="grid-cards" id="active"></div>
   </section>
@@ -216,7 +359,7 @@
     <div class="row" style="margin-bottom:12px">
       <h2 style="margin:0">Registered Repos &amp; Launchers</h2>
       <div class="spacer"></div>
-      <button class="btn primary" id="btn-add">+ Add Repo / Launcher</button>
+      <button class="btn icon primary" id="btn-add" type="button" aria-label="Add repo or launcher" title="Add repo or launcher"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-plus"/></svg></button>
     </div>
     <div class="tbl-wrap">
       <table>
@@ -240,7 +383,7 @@
       <label for="f-path">Repo path</label>
       <div class="row" style="gap:8px; flex-wrap:nowrap">
         <input id="f-path" type="text" placeholder="/home/sean/repos/my-repo" style="flex:1">
-        <button class="btn" id="btn-inspect" type="button">Auto-Detect</button>
+        <button class="btn icon" id="btn-browse" type="button" aria-label="Browse folders" title="Browse folders"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-folder"/></svg></button>
       </div>
     </div>
     <div class="field"><label for="f-name">Name</label><input id="f-name" type="text"></div>
@@ -259,6 +402,7 @@
           <option value="vllm">vllm</option>
           <option value="tensorfold">tensorfold</option>
           <option value="velogb10">velogb10</option>
+          <option value="rust-embed">rust-embed</option>
         </select>
       </div>
     </div>
@@ -266,8 +410,31 @@
     <div class="field"><label for="f-procmatch">Process match (optional)</label><input id="f-procmatch" type="text" placeholder="e.g. vllm serve"></div>
     <div class="form-err" id="add-err"></div>
     <div class="row" style="justify-content:flex-end">
-      <button class="btn" id="btn-cancel" type="button">Cancel</button>
-      <button class="btn primary" id="btn-register" type="button">Register</button>
+      <button class="btn icon" id="btn-cancel" type="button" aria-label="Cancel" title="Cancel"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-close"/></svg></button>
+      <button class="btn icon primary" id="btn-register" type="button" aria-label="Register" title="Register"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-check"/></svg></button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Folder browser modal (stacks above the add modal) ===== -->
+<div class="overlay" id="fsoverlay">
+  <div class="modal" id="fsmodal" role="dialog" aria-modal="true" aria-labelledby="fstitle" tabindex="-1">
+    <div class="row" style="margin-bottom:10px">
+      <h3 id="fstitle" style="margin:0">Choose a folder</h3>
+      <div class="spacer"></div>
+      <button class="btn icon" id="btn-fs-close" type="button" aria-label="Close folder browser" title="Close folder browser"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-close"/></svg></button>
+    </div>
+    <div class="row fs-bar">
+      <button class="btn icon" id="btn-fs-up" type="button" aria-label="Go to parent folder" title="Go to parent folder" disabled><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-up"/></svg></button>
+      <span class="fs-crumbs" id="fs-path">—</span>
+    </div>
+    <ul class="fs-list" id="fs-list" role="listbox" tabindex="0" aria-label="Folders and files"></ul>
+    <div class="row fs-errrow">
+      <div class="form-err" id="fs-err" role="alert"></div>
+      <button class="btn" id="btn-fs-root" type="button" hidden>Start at root</button>
+    </div>
+    <div class="row" style="justify-content:flex-end; margin-top:6px">
+      <button class="btn primary" id="btn-fs-use" type="button" aria-label="Use this folder" title="Use this folder" disabled>Use this folder</button>
     </div>
   </div>
 </div>
@@ -278,8 +445,8 @@
     <h3 id="log-title" style="font-family:var(--mono); font-size:13px">logs</h3>
     <span class="muted small" id="log-source"></span>
     <div class="spacer"></div>
-    <button class="btn" id="btn-log-refresh" type="button">Refresh</button>
-    <button class="btn" id="btn-log-close" type="button">Close</button>
+    <button class="btn icon" id="btn-log-refresh" type="button" aria-label="Refresh logs" title="Refresh logs"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-refresh"/></svg></button>
+    <button class="btn icon" id="btn-log-close" type="button" aria-label="Close log panel" title="Close log panel"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-close"/></svg></button>
   </header>
   <pre id="log-pre">—</pre>
 </div>
@@ -310,8 +477,48 @@ function el(tag, attrs = {}, ...kids) {
   return n;
 }
 
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+/* Builds an <svg><use> pointing at a sprite symbol. Stroke/fill/line caps are
+   inherited from the .ic class, so the symbols stay bare geometry. */
+function icon(name, size = 16) {
+  const svg = document.createElementNS(SVGNS, 'svg');
+  svg.setAttribute('class', 'ic');
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const use = document.createElementNS(SVGNS, 'use');
+  use.setAttribute('href', `#ic-${name}`);
+  svg.append(use);
+  return svg;
+}
+
+/* Icon-only buttons carry their label in aria-label + title; they never rely on
+   a text node, so nothing can read .textContent to decide behaviour. */
+function iconBtn(name, label, opts = {}) {
+  const b = el('button', {
+    class: `btn icon${opts.cls ? ` ${opts.cls}` : ''}`,
+    type: 'button',
+    'aria-label': label,
+    title: label,
+    onclick: opts.onclick || null,
+  }, icon(name, opts.size || 16));
+  if (opts.disabled) b.disabled = true;
+  return b;
+}
+
 const fmtGiB = (b) => (b == null ? '—' : (b / GiB).toFixed(1));
 const fmtInt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+
+function fmtSize(b) {
+  if (b == null) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = Number(b), i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+}
 
 function fmtUptime(s) {
   if (s == null) return '—';
@@ -328,7 +535,7 @@ function truncMid(s, max = 44) {
   if (!s) return '—';
   if (s.length <= max) return s;
   const half = Math.floor((max - 1) / 2);
-  return s.slice(0, half) + '…' + s.slice(s.length - half);
+  return `${s.slice(0, half)}…${s.slice(s.length - half)}`;
 }
 
 function useClass(pct) {
@@ -341,7 +548,7 @@ function useClass(pct) {
 /* ============================ toasts ============================ */
 
 function toast(msg, kind = 'ok') {
-  const t = el('div', { class: 'toast' + (kind === 'err' ? ' err' : ''), text: msg });
+  const t = el('div', { class: `toast${kind === 'err' ? ' err' : ''}`, text: msg });
   $('#toasts').append(t);
   setTimeout(() => t.remove(), 4000);
 }
@@ -372,7 +579,7 @@ let logTarget = null;            // entry id currently open in the log panel
 /* ============================ top banner ============================ */
 
 function checkDot(name, ok) {
-  return el('span', { class: 'check ' + (ok ? 'ok' : 'bad'), title: `${name}: ${ok ? 'ok' : 'FAIL'}` });
+  return el('span', { class: `check ${ok ? 'ok' : 'bad'}`, title: `${name}: ${ok ? 'ok' : 'FAIL'}` });
 }
 
 function bar(fillPct, ...extraClass) {
@@ -405,8 +612,8 @@ function renderTop(st) {
     checkDot('ai2_stat', checks.ai2_stat));
 
   const raidOk = !!checks.ai_raid;
-  const raid = el('span', { class: 'pill ' + (raidOk ? 'on' : 'off'), title: 'RAID0 /dev/md0 health (ai_raid check)' },
-    el('span', { class: 'dot' }), 'RAID0 /dev/md0: ' + (raidOk ? 'HEALTHY' : 'DEGRADED'));
+  const raid = el('span', { class: `pill ${raidOk ? 'on' : 'off'}`, title: 'RAID0 /dev/md0 health (ai_raid check)' },
+    el('span', { class: 'dot' }), `RAID0 /dev/md0: ${raidOk ? 'HEALTHY' : 'DEGRADED'}`);
 
   const left = el('div', { class: 'row' }, pill, checkRow, raid);
 
@@ -420,17 +627,21 @@ function renderTop(st) {
       bar(pct),
       el('span', { class: 'small mono' },
         `${fmtGiB(d.used_bytes)} / ${fmtGiB(d.total_bytes)} GiB `,
-        el('span', { class: 'pct ' + useClass(pct) }, `(${(pct || 0).toFixed(1)}%)`)));
+        el('span', { class: `pct ${useClass(pct)}`.trim() }, `(${(pct || 0).toFixed(1)}%)`)));
   } else {
     capEl = el('span', { class: 'muted small' }, 'Shared storage: no data');
   }
 
-  const dropBtn = el('button', {
-    class: 'btn' + (busy.has('drop') ? ' busy' : ''),
-    type: 'button',
+  const dropBtn = iconBtn('flush', 'Drop page cache on ai + ai2', {
+    cls: busy.has('drop') ? 'busy' : '',
     onclick: dropCaches,
-  }, 'Drop Page Cache (ai + ai2)');
-  if (!online) { dropBtn.disabled = true; dropBtn.title = 'Storage offline'; }
+  });
+  if (!online) {
+    // Keep the action name in the accessible name; only the reason is appended.
+    dropBtn.disabled = true;
+    dropBtn.title = 'Storage offline — page cache cannot be dropped';
+    dropBtn.setAttribute('aria-label', 'Drop page cache on ai + ai2 (storage offline)');
+  }
 
   root.append(el('div', { class: 'row' }, left, capEl, el('div', { class: 'spacer' }), dropBtn));
 }
@@ -455,7 +666,7 @@ async function dropCaches() {
 /* ============================ node cards ============================ */
 
 function nodeCard(name, role, cur, stale) {
-  const card = el('div', { class: 'card' + (stale ? ' unreachable' : ''), style: 'background:#0d1118' });
+  const card = el('div', { class: `card${stale ? ' unreachable' : ''}`, style: 'background:#0d1118' });
   card.append(el('div', { class: 'row', style: 'margin-bottom:10px' },
     el('h3', {}, `${name} — ${role}`),
     el('div', { class: 'spacer' }),
@@ -479,8 +690,7 @@ function nodeCard(name, role, cur, stale) {
       el('div', { class: 'label' }, `Used: ${fmtGiB(cur.mem_used_bytes)} / ${fmtGiB(cur.mem_total_bytes)} GiB`),
       el('div', { class: 'label' }, `Page Cache: ${fmtGiB(cur.mem_cache_bytes)} GiB`),
       el('div', { class: 'label' },
-        `Swap Used: ${fmtGiB(cur.swap_used_bytes)}` +
-        (cur.swap_total_bytes ? ` / ${fmtGiB(cur.swap_total_bytes)} GiB` : '')))));
+        `Swap Used: ${fmtGiB(cur.swap_used_bytes)}${cur.swap_total_bytes ? ` / ${fmtGiB(cur.swap_total_bytes)} GiB` : ''}`))));
 
   // local disk
   const dk = cur.disk;
@@ -489,7 +699,7 @@ function nodeCard(name, role, cur, stale) {
       el('div', { class: 'row', style: 'margin-bottom:2px' },
         el('span', { class: 'muted small' }, `Local Disk ${dk.mount || '/'}`),
         el('div', { class: 'spacer' }),
-        el('span', { class: 'small pct ' + useClass(dk.use_pct) }, `${dk.use_pct != null ? dk.use_pct.toFixed(1) : '—'}%`)),
+        el('span', { class: `small pct ${useClass(dk.use_pct)}`.trim() }, `${dk.use_pct != null ? dk.use_pct.toFixed(1) : '—'}%`)),
       bar(dk.use_pct),
       el('div', { class: 'stat-grid' },
         el('div', { class: 'label' }, `Used: ${fmtGiB(dk.used_bytes)} / ${fmtGiB(dk.total_bytes)} GiB`),
@@ -515,10 +725,261 @@ function renderNodes(nodes) {
   wrap.append(nodeCard('ai2', 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale));
 }
 
+/* ============================ thermal & load ============================ */
+
+// Client-side only: /api/state carries no history, so points are accumulated
+// from each poll in this tab. Nothing is persisted and nothing is sent back.
+const THERMAL_MAX_POINTS = 900;   // 900 × 2 s = 30 min of samples
+const thermalHist = { ai: [], ai2: [] };
+const thermalUI = { ai: null, ai2: null };
+let thermalWindow = 900;          // seconds of history shown (default 15m)
+let lastThermalNodes = null;
+let thermalResizeTimer = null;
+
+// warn/crit are readout thresholds; crit === null means the series has no red
+// state. `color` is series identity, not status. `dash` is the canvas line
+// pattern, so the two load series differ by shape as well as colour.
+const THERMAL_SERIES = [
+  { key: 'gpu_temp_c',   name: 'GPU temp',     unit: '°C', color: '#f0883e', warn: 80, crit: 90 },
+  { key: 'cpu_temp_c',   name: 'CPU/SoC temp', unit: '°C', color: '#b48ef5', warn: 90, crit: 95 },
+  { key: 'cpu_load_pct', name: 'CPU load',     unit: '%',  color: '#4f9cf9', warn: 85, crit: null },
+  // GPU load is deliberately threshold-free: 100% is what a node looks like
+  // while it is serving, so colouring it amber/red would flag normal operation.
+  // It shares the right-hand % axis with CPU load, hence the dashed line.
+  { key: 'gpu_load_pct', name: 'GPU load',     unit: '%',  color: '#2dd4bf', warn: null, crit: null, dash: [4, 3] },
+];
+
+const THERMAL_MISSING = '—';
+
+function numOrNull(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim() !== '') {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function thermalClass(v, s) {
+  if (v == null) return '';
+  if (s.crit != null && v > s.crit) return 'crit';
+  if (s.warn != null && v > s.warn) return 'warn';
+  return '';
+}
+
+function recordThermal(nodes) {
+  const t = Date.now();
+  for (const name of ['ai', 'ai2']) {
+    const n = nodes ? nodes[name] : null;
+    const point = { t };
+    for (const s of THERMAL_SERIES) {
+      // Nulls stay null: the chart breaks the line instead of dropping to zero.
+      point[s.key] = n ? numOrNull(n[s.key]) : null;
+    }
+    const arr = thermalHist[name];
+    arr.push(point);
+    while (arr.length > THERMAL_MAX_POINTS) arr.shift();
+  }
+}
+
+function buildThermalPanels() {
+  const wrap = $('#thermal');
+  if (!wrap || thermalUI.ai) return;
+
+  for (const spec of [{ name: 'ai', role: 'Head' }, { name: 'ai2', role: 'Worker' }]) {
+    const readouts = {};
+    const cells = THERMAL_SERIES.map((s) => {
+      const value = el('span', { class: 'value', text: THERMAL_MISSING });
+      readouts[s.key] = value;
+      return el('div', { class: 'readout' },
+        el('div', { class: 'label', text: s.name }),
+        el('div', {}, value, el('span', { class: 'unit', text: s.unit })));
+    });
+    const canvas = el('canvas', {
+      class: 'thermal-chart',
+      role: 'img',
+      'aria-label': `${spec.name} thermal and load history`,
+    });
+
+    wrap.append(el('div', { class: 'card', style: 'background:#0d1118' },
+      el('div', { class: 'row' }, el('h3', {}, `${spec.name} — ${spec.role}`)),
+      el('div', { class: 'readouts' }, ...cells),
+      canvas,
+      el('div', { class: 'legend' }, ...THERMAL_SERIES.map((s) =>
+        el('span', { class: 'key' },
+          // Dashed series get a dashed swatch, so the legend carries the same
+          // shape cue as the chart rather than colour alone.
+          el('span', {
+            class: 'swatch',
+            style: s.dash
+              ? `background:repeating-linear-gradient(90deg, ${s.color} 0 4px, transparent 4px 7px)`
+              : `background:${s.color}`,
+          }),
+          s.name)))));
+
+    thermalUI[spec.name] = { readouts, canvas };
+  }
+}
+
+function updateThermalPanel(name, node) {
+  const ui = thermalUI[name];
+  if (!ui) return;
+  const summary = [];
+  for (const s of THERMAL_SERIES) {
+    const v = node ? numOrNull(node[s.key]) : null;
+    const value = ui.readouts[s.key];
+    value.textContent = v == null ? THERMAL_MISSING : v.toFixed(1);
+    value.className = `value ${thermalClass(v, s)}`.trim();
+    summary.push(`${s.name} ${v == null ? 'unavailable' : `${v.toFixed(1)} ${s.unit}`}`);
+  }
+  ui.canvas.setAttribute('aria-label', `${name} thermal and load history. ${summary.join(', ')}.`);
+}
+
+function drawThermalChart(canvas, points, windowSec) {
+  const cssW = canvas.clientWidth;
+  const cssH = canvas.clientHeight;
+  if (!cssW || !cssH) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = '#0a0d13';
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  const padL = 32, padR = 36, padT = 22, padB = 18;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+  if (plotW < 40 || plotH < 30) return;
+
+  const spanMs = windowSec * 1000;
+  // Right edge is real wall-clock time, so a stalled feed leaves a growing gap
+  // at "now" instead of silently freezing the axis.
+  const now = Date.now();
+  const t0 = now - spanMs;
+
+  // Both series families share a 0-100 scale: °C on the left, % on the right.
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(139,148,167,.13)';
+  ctx.beginPath();
+  for (let i = 0; i <= 5; i++) {
+    const y = Math.round(padT + (plotH * i) / 5) + 0.5;
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+  }
+  ctx.stroke();
+
+  // Vertical gridlines land on round minute marks for the selected window.
+  const stepMin = windowSec <= 300 ? 60 : 300;
+  const tickCount = Math.max(1, Math.round(windowSec / stepMin));
+  ctx.beginPath();
+  for (let i = 0; i <= tickCount; i++) {
+    const x = Math.round(padL + (plotW * i) / tickCount) + 0.5;
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+  }
+  ctx.stroke();
+
+  ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  ctx.fillStyle = '#8b94a7';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 5; i++) {
+    ctx.fillText(String(100 - i * 20), padL - 6, padT + (plotH * i) / 5);
+  }
+  ctx.textAlign = 'left';
+  for (let i = 0; i <= 5; i++) {
+    ctx.fillText(`${100 - i * 20}%`, padL + plotW + 6, padT + (plotH * i) / 5);
+  }
+
+  ctx.fillStyle = '#8b94a7';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillText('°C', 4, 3);
+  ctx.textAlign = 'right';
+  ctx.fillText('%', cssW - 4, 3);
+
+  for (let i = 0; i <= tickCount; i++) {
+    const secsAgo = Math.round(windowSec - i * stepMin);
+    const label = secsAgo <= 0 ? 'now' : `−${Math.round(secsAgo / 60)}m`;
+    const x = padL + (plotW * i) / tickCount;
+    ctx.textAlign = i === 0 ? 'left' : (i === tickCount ? 'right' : 'center');
+    ctx.fillText(label, x, padT + plotH + 5);
+  }
+
+  const visible = points.filter((p) => p.t >= t0);
+  const hasReadings = visible.some((p) => THERMAL_SERIES.some((s) => p[s.key] != null));
+
+  for (const s of THERMAL_SERIES) {
+    let pen = false;
+    let last = null;
+    ctx.beginPath();
+    for (const p of visible) {
+      const v = p[s.key];
+      if (v == null) { pen = false; continue; }   // gap, not a drop to zero
+      const frac = Math.min(1, Math.max(0, (p.t - t0) / spanMs));
+      const x = padL + frac * plotW;
+      const y = padT + plotH - (Math.min(100, Math.max(0, v)) / 100) * plotH;
+      if (pen) ctx.lineTo(x, y);
+      else { ctx.moveTo(x, y); pen = true; }
+      last = { x, y, v };
+    }
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1.6;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.setLineDash(s.dash || []);   // GPU load dashed, everything else solid
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    if (last) {
+      const cls = thermalClass(last.v, s);
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 2.6, 0, Math.PI * 2);
+      ctx.fillStyle = cls === 'crit' ? '#ef4444' : (cls === 'warn' ? '#f59e0b' : s.color);
+      ctx.fill();
+    }
+  }
+
+  if (!hasReadings) {
+    ctx.fillStyle = '#8b94a7';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '11px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillText(visible.length ? 'no sensor readings' : 'collecting samples…',
+      padL + plotW / 2, padT + plotH / 2);
+  }
+}
+
+function renderThermal(nodes) {
+  buildThermalPanels();
+  if (nodes) lastThermalNodes = nodes;
+
+  for (const name of ['ai', 'ai2']) {
+    updateThermalPanel(name, nodes ? nodes[name] : null);
+    if (document.hidden) continue;   // no point repainting a chart nobody sees
+    const ui = thermalUI[name];
+    if (ui) drawThermalChart(ui.canvas, thermalHist[name], thermalWindow);
+  }
+}
+
+function setThermalWindow(sec) {
+  thermalWindow = sec;
+  for (const b of document.querySelectorAll('#thermal-window [data-window]')) {
+    const on = Number(b.dataset.window) === sec;
+    b.classList.toggle('primary', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  renderThermal(lastThermalNodes);
+}
+
 /* ============================ endpoint cards ============================ */
 
 function statusBadge(status) {
-  return el('span', { class: 'badge ' + status, text: status === 'STARTING' ? 'STARTING…' : status });
+  return el('span', { class: `badge ${status}`, text: status === 'STARTING' ? 'STARTING…' : status });
 }
 
 function epStat(label, ...vals) {
@@ -583,7 +1044,6 @@ function renderActive(entries) {
       el('div', { class: 'value' }, fmtInt(t.total_tokens_generated)),
       tokExtras.length ? el('div', { class: 'sub' }, tokExtras.join(' · ')) : null);
 
-    const stopBusy = busy.has(`${e.id}:stop`);
     const card = el('div', { class: 'card ep-card', style: 'background:#0d1118' },
       el('div', { class: 'row' },
         el('h3', { class: 'mono' }, e.name),
@@ -595,27 +1055,28 @@ function renderActive(entries) {
       el('div', { class: 'ep-stats' },
         epStat('Memory Used', memLine),
         epStat('Concurrent Requests', el('span', {}, conc, queued ? el('span', { class: 'muted' }, queued) : null))),
-      el('div', { class: 'row', style: 'justify-content:flex-end' },
-        el('button', { class: 'btn', type: 'button', onclick: () => openLogs(e.id, e.name) }, 'Logs'),
-        el('button', { class: 'btn', type: 'button', onclick: () => openEdit(e) }, 'Edit'),
-        el('button', {
-          class: 'btn danger' + (stopBusy ? ' busy' : ''), type: 'button',
-          onclick: () => stopEntry(e.id, e.name),
-        }, 'Stop')));
+      // Same icon-only actions as the registry table, so the two surfaces agree.
+      el('div', { class: 'row', style: 'justify-content:flex-end; gap:6px' },
+        actionBtn(e.id, 'logs', 'logs', 'Logs', '', '', (id) => openLogs(id, e.name)),
+        actionBtn(e.id, 'edit', 'edit', 'Edit', '', '', () => openEdit(e)),
+        actionBtn(e.id, 'stop', 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name))));
     wrap.append(card);
   }
 }
 
 /* ============================ registry table ============================ */
 
-function actionBtn(id, key, label, cls, title, onClick, hidden) {
+/* Icon-only row action. The label lives in aria-label + title, never in a text
+   node, so callers can't mistake the button for its label. */
+function actionBtn(id, key, iconName, label, cls, title, onClick, hidden) {
   const isBusy = busy.has(`${id}:${key}`);
   const b = el('button', {
-    class: `btn ${cls || ''}` + (isBusy ? ' busy' : '') + (hidden ? ' ghosted' : ''),
+    class: `btn icon ${cls || ''}${isBusy ? ' busy' : ''}${hidden ? ' ghosted' : ''}`,
     type: 'button',
+    'aria-label': title || label,
+    title: title || label,
     onclick: () => onClick(id),
-  }, label);
-  if (title) b.title = title;
+  }, icon(iconName));
   return b;
 }
 
@@ -632,6 +1093,9 @@ function renderTable(entries, storage) {
     const startHidden = e.status === 'RUNNING';
     const stopHidden = !(e.status === 'RUNNING' || e.status === 'STARTING');
     const startDisabled = startHidden || e.status === 'STARTING' || busy.has(`${e.id}:start`);
+
+    const startBtn = actionBtn(e.id, 'start', 'play', 'Start', '', offline ? 'Storage offline' : '', startEntry, startHidden);
+
     const tr = el('tr', {},
       el('td', { class: 'mono' }, e.name),
       el('td', { class: 'muted mono', title: e.path }, truncMid(e.path)),
@@ -640,22 +1104,26 @@ function renderTable(entries, storage) {
       el('td', { class: 'mono' }, e.engine || '—'),
       el('td', {}, statusBadge(e.status)),
       el('td', { class: 'acts' },
-        actionBtn(e.id, 'start', 'Start', '', offline ? 'Storage offline' : '', (id) => startEntry(id), startHidden),
-        actionBtn(e.id, 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name), stopHidden),
-        actionBtn(e.id, 'logs', 'Logs', '', '', (id) => openLogs(id, e.name)),
-        actionBtn(e.id, 'edit', 'Edit', '', '', () => openEdit(e)),
-        actionBtn(e.id, 'remove', 'Remove', 'danger', '', (id) => removeEntry(id, e.name))));
+        startBtn,
+        actionBtn(e.id, 'stop', 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name), stopHidden),
+        actionBtn(e.id, 'logs', 'logs', 'Logs', '', '', (id) => openLogs(id, e.name)),
+        actionBtn(e.id, 'edit', 'edit', 'Edit', '', '', () => openEdit(e)),
+        actionBtn(e.id, 'remove', 'trash', 'Delete', 'danger', '', (id) => removeEntry(id, e.name))));
 
-    const startBtn = tr.querySelector('td.acts .btn');
-    if (startDisabled && startBtn && startBtn.textContent === 'Start') {
+    // Decoupled from the label: the button is held by reference, so icon-only
+    // markup can't break the disabled/busy state.
+    if (startDisabled && startBtn) {
       startBtn.disabled = true;
-      if (e.status === 'STARTING') startBtn.title = 'starting…';
+      if (e.status === 'STARTING') {
+        startBtn.title = 'Starting…';
+        startBtn.setAttribute('aria-label', 'Start (starting…)');
+      }
     }
     body.append(tr);
   }
   if (!sorted.length) {
     body.append(el('tr', {}, el('td', { colspan: '7', class: 'muted', style: 'text-align:center; padding:20px' },
-      'No repos registered. Click “+ Add Repo / Launcher” to register one.')));
+      'No repos registered. Use + to register one.')));
   }
 }
 
@@ -707,10 +1175,20 @@ async function removeEntry(id, name) {
 const addOverlay = $('#addoverlay');
 let editTarget = null;
 
+/* The primary button is icon-only, so mode is expressed through its accessible
+   name and tooltip. Handlers key off editTarget, never off the button text. */
+function setRegisterMode(editing) {
+  const btn = $('#btn-register');
+  const label = editing ? 'Save changes' : 'Register';
+  btn.setAttribute('aria-label', label);
+  btn.title = label;
+  btn.dataset.mode = editing ? 'edit' : 'add';
+}
+
 function openAdd() {
   editTarget = null;
   $('#addtitle').textContent = 'Add Repo / Launcher';
-  $('#btn-register').textContent = 'Register';
+  setRegisterMode(false);
   $('#add-err').textContent = '';
   $('#f-path').value = '';
   $('#f-name').value = '';
@@ -729,7 +1207,7 @@ function openAdd() {
 function openEdit(e) {
   editTarget = e.id;
   $('#addtitle').textContent = `Edit — ${e.name || e.id}`;
-  $('#btn-register').textContent = 'Save Changes';
+  setRegisterMode(true);
   $('#add-err').textContent = '';
   $('#f-path').value = e.path || '';
   $('#f-name').value = e.name || e.id || '';
@@ -765,37 +1243,202 @@ function addFormBody() {
   };
 }
 
-async function autoDetect() {
-  const path = $('#f-path').value.trim();
-  const errEl = $('#add-err');
-  errEl.textContent = '';
-  if (!path) { errEl.textContent = 'Enter a repo path first.'; return; }
+/* ============================ folder browser ============================ */
+/*
+  Reads GET /api/fs/list (root-jailed to /home/sean). Every navigation bumps
+  fsSeq so a slow, superseded response can never overwrite the folder the user
+  is now looking at. fsValid is only true when the breadcrumb reflects a real
+  listing — that is what gates "Use this folder".
+*/
 
-  const btn = $('#btn-inspect');
-  btn.classList.add('busy');
-  try {
-    const r = await api('/api/entries/inspect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    const s = r && r.suggestion;
-    if (!s) { errEl.textContent = 'Auto-detect returned no suggestion.'; return; }
-    $('#f-name').value = s.name || '';
-    $('#f-start').value = s.start_cmd || '';
-    $('#f-stop').value = s.stop_cmd || '';
-    $('#f-host').value = s.host || '192.168.20.63';
-    if (s.port != null) $('#f-port').value = s.port;
-    $('#f-slot').value = s.slot || '';
-    if (s.engine) $('#f-engine').value = s.engine;
-    $('#f-containers').value = Array.isArray(s.containers) ? s.containers.join(', ') : '';
-    $('#f-procmatch').value = s.process_match || '';
-    toast('Auto-detect complete — review fields and save.', 'ok');
-  } catch (e) {
-    errEl.textContent = `Auto-detect failed: ${e.message}`;
-  } finally {
-    btn.classList.remove('busy');
+const fsOverlay = $('#fsoverlay');
+const fsModalEl = $('#fsmodal');
+const fsListEl = $('#fs-list');
+const fsPathEl = $('#fs-path');
+const fsUpBtn = $('#btn-fs-up');
+const fsUseBtn = $('#btn-fs-use');
+const fsErrEl = $('#fs-err');
+const fsRootBtn = $('#btn-fs-root');
+
+let fsCur = null;        // canonical path of the last successful listing
+let fsAsked = null;      // path we requested (breadcrumb shows this on error)
+let fsParent = null;     // canonical parent, or null at the jail root
+let fsEntries = [];
+let fsSelected = null;   // highlighted entry path
+let fsValid = false;
+let fsLoading = false;
+let fsSeq = 0;
+let fsFocusReturn = null;
+
+function fsErrorText(e) {
+  if (e && e.status === 403) return 'That location is outside the browsable roots (/home/sean, /mnt/nvmeof).';
+  if (e && e.status === 400) return 'That location is not a directory.';
+  if (e && e.status === 500) return 'The filesystem root is unavailable on the server right now.';
+  return `Could not read that folder: ${(e && e.message) || 'unknown error'}`;
+}
+
+/* The primary action targets the selected folder when there is one, otherwise
+   the folder currently being browsed. Label and tooltip follow the same rule so
+   the highlight never promises something the button won't do. */
+function fsSyncUse() {
+  const target = fsSelected || fsCur;
+  const label = fsSelected ? 'Use selected folder' : 'Use this folder';
+  if (fsUseBtn.textContent !== label) fsUseBtn.textContent = label;
+  fsUseBtn.setAttribute('aria-label', label);
+  fsUseBtn.title = label;
+  fsUseBtn.disabled = fsLoading || !fsValid || !target;
+}
+
+function fsPaint() {
+  fsPathEl.textContent = (fsValid ? fsCur : fsAsked) || '(root)';
+  fsPathEl.title = fsPathEl.textContent;
+
+  fsUpBtn.disabled = fsLoading || fsParent == null;
+  fsSyncUse();
+  fsRootBtn.hidden = fsLoading || fsValid;
+
+  fsListEl.replaceChildren();
+  if (fsLoading) {
+    fsListEl.append(el('li', { class: 'fs-empty' }, 'loading…'));
+    return;
   }
+  if (!fsEntries.length) {
+    // On an error the inline message is the whole story — no empty-state noise.
+    if (fsValid) fsListEl.append(el('li', { class: 'fs-empty' }, 'This folder is empty.'));
+    return;
+  }
+
+  const dirs = fsEntries.filter((x) => x.kind === 'dir');
+  const files = fsEntries.filter((x) => x.kind !== 'dir');
+  // The server sorts already; sorting here keeps the guarantee local.
+  dirs.sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  for (const item of [...dirs, ...files]) fsListEl.append(fsItemEl(item));
+}
+
+function fsItemEl(item) {
+  const isDir = item.kind === 'dir';
+
+  const li = el('li', {
+    class: `fs-item ${isDir ? 'dir' : 'file'}`,
+    role: 'option',
+    tabindex: isDir ? '0' : '-1',
+    'aria-selected': fsSelected === item.path ? 'true' : 'false',
+    'aria-disabled': isDir ? 'false' : 'true',
+    title: item.path,
+  },
+    icon(isDir ? 'folder' : 'file', 15),
+    el('span', { class: 'name' }, `${item.name}${isDir ? '/' : ''}`),
+    isDir ? null : el('span', { class: 'size' }, fmtSize(item.size)));
+
+  // Files are listed for orientation only: no selection, no navigation.
+  li.addEventListener('click', () => { if (isDir) fsSelect(item, li); });
+  li.addEventListener('dblclick', () => fsEnter(item));
+  li.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      fsEnter(item);
+    } else if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      fsMoveFocus(ev.key === 'ArrowDown' ? 1 : -1, li);
+    } else if (ev.key === ' ') {
+      ev.preventDefault();
+      if (isDir) fsSelect(item, li);
+    }
+  });
+  return li;
+}
+
+function fsSelect(item, li) {
+  fsSelected = item.path;
+  for (const n of fsListEl.querySelectorAll('.fs-item')) {
+    n.setAttribute('aria-selected', n === li ? 'true' : 'false');
+  }
+  fsSyncUse();
+  li.focus();
+}
+
+function fsMoveFocus(delta, from) {
+  const items = [...fsListEl.querySelectorAll('.fs-item.dir')];
+  const i = items.indexOf(from);
+  const next = items[Math.max(0, Math.min(items.length - 1, (i < 0 ? 0 : i) + delta))];
+  if (next) next.focus();
+}
+
+function fsEnter(item) {
+  if (item && item.kind === 'dir') fsLoad(item.path, true);
+}
+
+async function fsLoad(path, focusAfter) {
+  const seq = ++fsSeq;
+  fsLoading = true;
+  fsValid = false;
+  fsSelected = null;
+  fsAsked = path || null;
+  fsErrEl.textContent = '';
+  fsPaint();
+
+  let url = '/api/fs/list';
+  if (path) url += `?path=${encodeURIComponent(path)}`;
+
+  try {
+    const r = await api(url);
+    if (seq !== fsSeq) return;                 // a newer navigation won
+    fsCur = r && r.path != null ? r.path : (path || null);
+    fsParent = r && r.parent != null ? r.parent : null;
+    fsEntries = r && Array.isArray(r.entries) ? r.entries : [];
+    fsLoading = false;
+    fsValid = true;
+    fsAsked = fsCur;
+    fsPaint();
+    if (focusAfter) {
+      const first = fsListEl.querySelector('.fs-item.dir') || fsListEl;
+      if (first) first.focus();
+    }
+  } catch (e) {
+    if (seq !== fsSeq) return;
+    fsCur = null;
+    fsParent = null;
+    fsEntries = [];
+    fsLoading = false;
+    fsValid = false;
+    fsErrEl.textContent = fsErrorText(e);      // 403 / 400 / 500 stay in the modal
+    fsPaint();
+    fsListEl.focus();
+  }
+}
+
+function openFsBrowser() {
+  // The browser only opens from the browse button, so that is the focus
+  // return target. Capturing document.activeElement is unreliable: Safari and
+  // Firefox don't focus buttons on click, so it would still be #f-path.
+  fsFocusReturn = $('#btn-browse');
+  fsCur = null; fsAsked = null; fsParent = null; fsEntries = [];
+  fsSelected = null; fsValid = false; fsLoading = true;
+  fsErrEl.textContent = '';
+  fsOverlay.classList.add('open');
+  fsModalEl.focus();
+  const start = $('#f-path').value.trim();
+  fsLoad(start || null, false);                // no path param → server root
+}
+
+function closeFs() {
+  if (!fsOverlay.classList.contains('open')) return;
+  fsOverlay.classList.remove('open');
+  fsSeq++;                                     // drop any in-flight response
+  fsErrEl.textContent = '';
+  const back = (fsFocusReturn && document.contains(fsFocusReturn)) ? fsFocusReturn : $('#btn-browse');
+  fsFocusReturn = null;
+  if (back) back.focus();
+}
+
+function fsUse() {
+  if (fsLoading || !fsValid) return;
+  const chosen = fsSelected || fsCur;      // selection wins; else current folder
+  if (!chosen) return;
+  $('#f-path').value = chosen;
+  closeFs();                               // restores focus to the browse button
+  toast(`Repo path set to ${truncMid(chosen, 60)}`);
 }
 
 async function register() {
@@ -880,6 +1523,7 @@ function renderAll(data) {
   if (!data) return;
   renderTop(data.storage);
   renderNodes(data.nodes);
+  renderThermal(data.nodes);
   renderActive(data.entries || []);
   renderTable(data.entries || [], data.storage);
 }
@@ -888,6 +1532,7 @@ async function poll() {
   try {
     const data = await api('/api/state');
     lastData = data;
+    recordThermal(data.nodes);
     $('#errbanner').classList.remove('show');
     renderAll(data);
   } catch {
@@ -901,16 +1546,34 @@ async function poll() {
 
 $('#btn-add').addEventListener('click', openAdd);
 $('#btn-cancel').addEventListener('click', closeAdd);
-$('#btn-inspect').addEventListener('click', autoDetect);
+$('#btn-browse').addEventListener('click', openFsBrowser);
 $('#btn-register').addEventListener('click', register);
 $('#btn-log-refresh').addEventListener('click', fetchLogs);
 $('#btn-log-close').addEventListener('click', closeLogs);
 addOverlay.addEventListener('click', (ev) => { if (ev.target === addOverlay) closeAdd(); });
+
+$('#btn-fs-close').addEventListener('click', closeFs);
+$('#btn-fs-up').addEventListener('click', () => { if (fsParent != null) fsLoad(fsParent, true); });
+$('#btn-fs-use').addEventListener('click', fsUse);
+$('#btn-fs-root').addEventListener('click', () => fsLoad(null, true));
+fsOverlay.addEventListener('click', (ev) => { if (ev.target === fsOverlay) closeFs(); });
+
+for (const b of document.querySelectorAll('#thermal-window [data-window]')) {
+  b.addEventListener('click', () => setThermalWindow(Number(b.dataset.window)));
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) renderThermal(lastThermalNodes);
+});
+window.addEventListener('resize', () => {
+  clearTimeout(thermalResizeTimer);
+  thermalResizeTimer = setTimeout(() => renderThermal(lastThermalNodes), 200);
+});
 document.addEventListener('keydown', (ev) => {
-  if (ev.key === 'Escape') {
-    if (addOverlay.classList.contains('open')) closeAdd();
-    if (logPanel.classList.contains('open')) closeLogs();
-  }
+  if (ev.key !== 'Escape') return;
+  // Dismiss the topmost surface only, so one Escape never closes two layers.
+  if (fsOverlay.classList.contains('open')) { closeFs(); return; }
+  if (logPanel.classList.contains('open')) { closeLogs(); return; }
+  if (addOverlay.classList.contains('open')) closeAdd();
 });
 
 poll();

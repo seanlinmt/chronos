@@ -29,6 +29,8 @@ pub struct Shared {
     pub probes: RwLock<HashMap<String, ProbeResult>>,
     pub states: RwLock<HashMap<String, String>>,
     pub grace: Mutex<HashMap<String, (GraceKind, Instant)>>,
+    /// node -> previous /proc/stat (busy, total) sample for CPU load deltas.
+    pub cpu_prev: std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
 }
 
 impl Shared {
@@ -155,7 +157,7 @@ async fn sys_loop(shared: Arc<Shared>) {
     loop {
         interval.tick().await;
         let storage = collect_storage().await;
-        let nodes = collect_nodes().await;
+        let nodes = collect_nodes(&shared.cpu_prev).await;
         let registry = shared.registry.read().unwrap().clone();
         let mem = collect_mem_attr(&registry).await;
         *shared.storage.write().unwrap() = storage;
@@ -202,6 +204,7 @@ impl Collector {
             probes: RwLock::new(HashMap::new()),
             states: RwLock::new(states),
             grace: Mutex::new(HashMap::new()),
+            cpu_prev: std::sync::Mutex::new(BTreeMap::new()),
         });
         // publish the initial snapshot so the first consumer frame has data
         shared.publish();
@@ -285,7 +288,15 @@ pub async fn run_dump_state() -> Value {
     let mut cs = CollectorState::default();
 
     let storage = collect_storage().await;
-    let nodes = collect_nodes().await;
+    // Seed a first /proc/stat sample so the one-pass dump can report ai's CPU
+    // load (collect_storage above supplies the delta window). ai2 has no
+    // previous sample in one-pass mode, so its load is None here.
+    let cpu_prev: std::sync::Mutex<BTreeMap<String, (u64, u64)>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    if let Some(sample) = crate::collectors::read_cpu_stat() {
+        cpu_prev.lock().unwrap().insert("ai".into(), sample);
+    }
+    let nodes = collect_nodes(&cpu_prev).await;
     let mem = collect_mem_attr(&registry).await;
     let probes = probe_all(&registry, &mut cs.prev, &client).await;
 

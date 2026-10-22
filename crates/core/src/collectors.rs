@@ -3,7 +3,7 @@
 //! All ai2 data arrives via ONE combined ssh blob per pass (meminfo, df,
 //! storage checks, GPU apps, docker ps, per-PID proc samples).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -104,6 +104,176 @@ pub fn jf(v: &Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
 }
 
+/// Hottest valid /sys/class/thermal thermal_zone*/temp value in °C.
+///
+/// On GB10 the only thermal_zone entries are the acpitz CPU/SoC zones (nvme/mlx5
+/// live in hwmon), so the max of valid zones is the CPU/SoC signal. Bogus
+/// sensors (e.g. -273150) are discarded.
+pub fn read_cpu_temp_max() -> Option<f64> {
+    let dir = std::fs::read_dir("/sys/class/thermal").ok()?;
+    let mut best: Option<f64> = None;
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("thermal_zone") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path().join("temp")) else {
+            continue;
+        };
+        let Ok(milli) = raw.trim().parse::<i64>() else {
+            continue;
+        };
+        if milli <= 0 || milli > 200_000 {
+            continue;
+        }
+        let c = milli as f64 / 1000.0;
+        best = Some(match best {
+            Some(b) if b >= c => b,
+            _ => c,
+        });
+    }
+    best
+}
+
+/// Max valid millidegree value from a newline-separated `temp` dump.
+pub fn parse_temp_max(text: &str) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for line in text.lines() {
+        let Ok(milli) = line.trim().parse::<i64>() else {
+            continue;
+        };
+        if milli <= 0 || milli > 200_000 {
+            continue;
+        }
+        let c = milli as f64 / 1000.0;
+        best = Some(match best {
+            Some(b) if b >= c => b,
+            _ => c,
+        });
+    }
+    best
+}
+
+/// Parse the csv line(s) of
+/// `nvidia-smi --query-gpu=temperature.gpu,utilization.gpu` into
+/// `(temperature °C, utilization %)`.
+///
+/// `[N/A]` (or any unparsable / out-of-range value) yields `None` for that
+/// component only, so a driver that reports temperature but not utilization
+/// still surfaces the temperature (and vice versa). The first line carrying a
+/// usable value wins; per-GPU lines are collapsed to the first usable sample.
+pub fn parse_gpu_stat(text: &str) -> (Option<f64>, Option<f64>) {
+    let mut temp_c: Option<f64> = None;
+    let mut load_pct: Option<f64> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split(',');
+        let t = fields
+            .next()
+            .map(str::trim)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|c| *c > 0.0 && *c <= 200.0);
+        let u = fields
+            .next()
+            .map(str::trim)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|p| (0.0..=100.0).contains(p));
+        if temp_c.is_none() {
+            temp_c = t;
+        }
+        if load_pct.is_none() {
+            load_pct = u;
+        }
+        if temp_c.is_some() && load_pct.is_some() {
+            break;
+        }
+    }
+    (temp_c, load_pct)
+}
+
+/// GPU temperature (°C) and utilization (%) from ONE nvidia-smi invocation.
+///
+/// Both queries are merged because nvidia-smi costs a few hundred ms and this
+/// runs per node per tick — never add a second call. `None` when the command
+/// fails or prints nothing usable; each inner value is `None` when the driver
+/// reports `[N/A]` for just that field.
+pub async fn read_gpu_stat() -> Option<(Option<f64>, Option<f64>)> {
+    let out = run_cmd(
+        "nvidia-smi",
+        &[
+            "--query-gpu=temperature.gpu,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    .await?;
+    let (temp_c, load_pct) = parse_gpu_stat(&out);
+    if temp_c.is_none() && load_pct.is_none() {
+        None
+    } else {
+        Some((temp_c, load_pct))
+    }
+}
+
+/// Parse the aggregate `cpu ` line of /proc/stat into (busy, total).
+/// busy = total - (idle + iowait).
+pub fn parse_cpu_stat(line: &str) -> Option<(u64, u64)> {
+    let rest = line.trim().strip_prefix("cpu")?;
+    // Aggregate line only: next char must be whitespace (not "cpu0").
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let fields: Vec<u64> = rest
+        .split_whitespace()
+        .map(|f| f.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if fields.len() < 4 {
+        return None;
+    }
+    let total: u64 = fields.iter().copied().fold(0u64, |a, b| a.saturating_add(b));
+    let idle = fields[3];
+    let iowait = fields.get(4).copied().unwrap_or(0);
+    let busy = total.saturating_sub(idle.saturating_add(iowait));
+    Some((busy, total))
+}
+
+/// Read /proc/stat and return the aggregate (busy, total) counters.
+pub fn read_cpu_stat() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/stat").ok()?;
+    s.lines().find_map(|l| {
+        if l.starts_with("cpu ") || l.starts_with("cpu\t") {
+            parse_cpu_stat(l)
+        } else {
+            None
+        }
+    })
+}
+
+/// Update the stored CPU sample for `node` and return the busy percentage
+/// derived from the delta against the previous sample.
+pub fn cpu_load_pct(
+    prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+    node: &str,
+    sample: (u64, u64),
+) -> Option<f64> {
+    let old = {
+        let mut guard = prev.lock().unwrap();
+        let old = guard.insert(node.to_string(), sample);
+        old
+    };
+    let (busy, total) = sample;
+    let (old_busy, old_total) = old?;
+    let total_delta = total.saturating_sub(old_total);
+    if total_delta == 0 {
+        return None;
+    }
+    let busy_delta = busy.saturating_sub(old_busy);
+    Some(100.0 * busy_delta as f64 / total_delta as f64)
+}
+
 /// Split a marker-delimited blob ("===NAME===") into sections.
 pub fn sections(s: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -192,6 +362,10 @@ echo '===DOCKERPS==='; docker ps --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev
 echo '===PROCS==='; for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
 rss=$(grep VmRSS /proc/$p/status 2>/dev/null | awk '{print $2}'); cg=$(tail -1 /proc/$p/cgroup 2>/dev/null); \
 cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200); echo \"PROC $p ${rss:-0} $cg\"; echo \"CMD $cm\"; done; \
+echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/null | head -200; \
+echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
+echo '===CPUSTAT==='; head -1 /proc/stat; \
+echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true; \
 echo '===END==='";
 
 // =============================================================================
@@ -293,10 +467,28 @@ pub async fn collect_storage() -> StorageState {
 // NODE METRICS
 // =============================================================================
 
-pub async fn node_from_blob(blob: &str) -> NodeState {
+pub async fn node_from_blob(
+    blob: &str,
+    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+) -> NodeState {
     let sec = sections(blob);
     let mem = sec.get("MEMINFO").and_then(|s| parse_meminfo(s));
     let disk = sec.get("DFROOT").and_then(|s| parse_df(s));
+    let cpu_temp = sec.get("CPUTEMP").and_then(|s| parse_temp_max(s));
+    let (gpu_temp, gpu_load) = sec
+        .get("GPUSTAT")
+        .map(|s| parse_gpu_stat(s))
+        .unwrap_or((None, None));
+    let load = sec
+        .get("CPUSTAT")
+        .and_then(|s| s.lines().find_map(|l| {
+            if l.starts_with("cpu ") || l.starts_with("cpu\t") {
+                parse_cpu_stat(l)
+            } else {
+                None
+            }
+        }))
+        .and_then(|sample| cpu_load_pct(cpu_prev, "ai2", sample));
     NodeState {
         mem_total_bytes: mem.map(|m| m.0 * 1024),
         mem_available_bytes: mem.map(|m| m.1 * 1024),
@@ -310,10 +502,16 @@ pub async fn node_from_blob(blob: &str) -> NodeState {
             avail_bytes: d.2,
             use_pct: d.3,
         }),
+        cpu_load_pct: load,
+        cpu_temp_c: cpu_temp,
+        gpu_temp_c: gpu_temp,
+        gpu_load_pct: gpu_load,
     }
 }
 
-pub async fn collect_nodes() -> BTreeMap<String, Option<NodeState>> {
+pub async fn collect_nodes(
+    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+) -> BTreeMap<String, Option<NodeState>> {
     let mut out = BTreeMap::new();
 
     // ai — local reads, each timeout-wrapped.
@@ -326,6 +524,31 @@ pub async fn collect_nodes() -> BTreeMap<String, Option<NodeState>> {
         run_cmd("df", &["-B1", "/"]),
     )
     .await;
+    let cpu_temp = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        async { read_cpu_temp_max() },
+    )
+    .await
+    .ok()
+    .flatten();
+    // One nvidia-smi call for both temperature and utilization per tick.
+    let (gpu_temp, gpu_load) = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        read_gpu_stat(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or((None, None));
+    let cpu_sample = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        async { read_cpu_stat() },
+    )
+    .await
+    .ok()
+    .flatten();
+    // Guard dropped inside cpu_load_pct before any await below.
+    let load = cpu_sample.and_then(|sample| cpu_load_pct(cpu_prev, "ai", sample));
     let ai_node = match (meminfo, df_root) {
         (Ok(Ok(m)), Ok(df)) => {
             let mem = parse_meminfo(&m);
@@ -343,6 +566,10 @@ pub async fn collect_nodes() -> BTreeMap<String, Option<NodeState>> {
                     avail_bytes: d.2,
                     use_pct: d.3,
                 }),
+                cpu_load_pct: load,
+                cpu_temp_c: cpu_temp,
+                gpu_temp_c: gpu_temp,
+                gpu_load_pct: gpu_load,
             })
         }
         _ => None,
@@ -354,7 +581,7 @@ pub async fn collect_nodes() -> BTreeMap<String, Option<NodeState>> {
     out.insert(
         "ai2".into(),
         match blob {
-            Ok(Ok(s)) => Some(node_from_blob(&s).await),
+            Ok(Ok(s)) => Some(node_from_blob(&s, cpu_prev).await),
             _ => None,
         },
     );
@@ -438,6 +665,7 @@ fn attribute_pids(
 ) -> HashMap<String, u64> {
     let by_pid: HashMap<u32, &ProcInfo> = procs.iter().map(|p| (p.pid, p)).collect();
     let mut out: HashMap<String, u64> = HashMap::new();
+    let mut attributed: HashSet<u32> = HashSet::new();
     for (pid, gpu_bytes) in gpu {
         let rss = by_pid.get(&pid).map(|p| p.rss_bytes).unwrap_or(0);
         let total = gpu_bytes + rss;
@@ -453,6 +681,57 @@ fn attribute_pids(
                 break; // attribute each pid to exactly one entry
             }
         }
+        attributed.insert(pid);
+    }
+
+    // CPU-only services (e.g. an embedding server with no CUDA allocation)
+    // never appear in the nvidia-smi compute-apps list, so they are invisible
+    // to the loop above. Attribute their RSS in a second pass, restricted to
+    // entries that explicitly opt in via `process_match` so entries relying on
+    // the id fallback do not sweep unrelated processes.
+    for p in &procs {
+        if attributed.contains(&p.pid) {
+            continue;
+        }
+        let cname = p
+            .container_hex
+            .as_ref()
+            .and_then(|hex| docker.get(hex))
+            .map(|s| s.as_str());
+        for e in registry {
+            if e.process_match.is_none() {
+                continue;
+            }
+            if entry_matches_pid(e, cname, &p.cmdline) {
+                *out.entry(e.id.clone()).or_insert(0) += p.rss_bytes;
+                attributed.insert(p.pid);
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+/// Parse the ===CPUPROCS=== section: `ps -eo pid=,rss=,args=` output.
+/// RSS is reported in KiB.
+fn parse_cpu_procs(s: &str) -> Vec<ProcInfo> {
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let mut it = line.split_whitespace();
+        let Some(pid) = it.next().and_then(|x| x.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(rss) = it.next().and_then(|x| x.parse::<u64>().ok()) else {
+            continue;
+        };
+        let cmdline = it.collect::<Vec<_>>().join(" ");
+        out.push(ProcInfo {
+            pid,
+            rss_bytes: rss * 1024,
+            container_hex: None,
+            cmdline,
+        });
     }
     out
 }
@@ -508,7 +787,7 @@ pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u6
     let docker_ai = run_cmd("docker", &["ps", "--no-trunc", "--format", "{{.ID}}|{{.Names}}"])
         .await
         .unwrap_or_default();
-    let procs_ai: Vec<ProcInfo> = parse_gpu_apps(&gpu_ai)
+    let mut procs_ai: Vec<ProcInfo> = parse_gpu_apps(&gpu_ai)
         .iter()
         .map(|(pid, _)| ProcInfo {
             pid: *pid,
@@ -517,6 +796,30 @@ pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u6
             cmdline: proc_cmdline(*pid),
         })
         .collect();
+
+    // CPU-only services never appear in the GPU compute-apps list. For entries
+    // that declare an explicit `process_match`, discover their PIDs here so the
+    // RSS second pass in `attribute_pids` has something to attribute.
+    for e in registry {
+        let Some(pm) = e.process_match.as_ref() else {
+            continue;
+        };
+        let found = run_cmd("pgrep", &["-f", pm]).await.unwrap_or_default();
+        for line in found.lines() {
+            let Ok(pid) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            if procs_ai.iter().any(|p| p.pid == pid) {
+                continue;
+            }
+            procs_ai.push(ProcInfo {
+                pid,
+                rss_bytes: proc_rss(pid).unwrap_or(0),
+                container_hex: proc_container(pid),
+                cmdline: proc_cmdline(pid),
+            });
+        }
+    }
     let docker_map = parse_docker_ps(&docker_ai);
     let ai_map = attribute_pids(parse_gpu_apps(&gpu_ai), &docker_map, procs_ai, registry);
 
@@ -529,7 +832,17 @@ pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u6
                 .get("DOCKERPS")
                 .map(|s| parse_docker_ps(s))
                 .unwrap_or_default();
-            let procs = sec.get("PROCS").map(|s| parse_remote_procs(s)).unwrap_or_default();
+            let mut procs = sec.get("PROCS").map(|s| parse_remote_procs(s)).unwrap_or_default();
+            // CPU-only services never appear in GPUAPPS, so fold in the full
+            // process list and let the `process_match` second pass attribute
+            // them by RSS.
+            if let Some(list) = sec.get("CPUPROCS") {
+                for p in parse_cpu_procs(list) {
+                    if !procs.iter().any(|q| q.pid == p.pid) {
+                        procs.push(p);
+                    }
+                }
+            }
             attribute_pids(gpu, &docker, procs, registry)
         }
         _ => HashMap::new(),

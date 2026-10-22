@@ -8,10 +8,11 @@
 //! Binds 0.0.0.0:8090 by default; override with `CHRONOS_HTTP_PORT`.
 
 use std::collections::HashMap;
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 use axum::routing::{delete, get, post};
@@ -135,6 +136,10 @@ fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
                 "avail_bytes": d.avail_bytes,
                 "use_pct": d.use_pct,
             })),
+            "cpu_load_pct": n.cpu_load_pct,
+            "cpu_temp_c": n.cpu_temp_c,
+            "gpu_temp_c": n.gpu_temp_c,
+            "gpu_load_pct": n.gpu_load_pct,
         }),
     }
 }
@@ -303,6 +308,7 @@ async fn add_entry(
     let engine = match input.engine.as_str() {
         "tensorfold" => "tensorfold",
         "velogb10" => "velogb10",
+        "rust-embed" => "rust-embed",
         _ => "vllm",
     }
     .to_string();
@@ -367,6 +373,7 @@ async fn update_entry(
     let engine = match input.engine.as_str() {
         "tensorfold" => "tensorfold",
         "velogb10" => "velogb10",
+        "rust-embed" => "rust-embed",
         _ => "vllm",
     }
     .to_string();
@@ -492,6 +499,8 @@ async fn inspect_entry(Json(body): Json<Value>) -> Result<Json<Value>, (StatusCo
 
     let engine = if files.iter().any(|f| f == "launch.sh") && hint_text.contains("tensorfold") {
         "tensorfold"
+    } else if hint_text.contains("rust-embed") || hint_text.contains("rust_embed") || name.contains("rust-embed") {
+        "rust-embed"
     } else {
         "vllm"
     };
@@ -650,6 +659,208 @@ async fn drop_caches() -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// /api/fs/list — filesystem browse for the "Add Repo" modal. Read-only.
+//
+// Multi-root jail. The browsable roots are CHRONOS_FS_ROOT — a colon-separated
+// list that REPLACES the defaults when set — or the defaults `/home/sean` and
+// `/mnt/nvmeof`. Two roots are needed because `/home/sean/repos` is a symlink
+// onto `/mnt/nvmeof/repos` (GFS2) while the registry legitimately stores repo
+// paths under both spellings (`/home/sean/repos/glm53-tensorfold-spark`,
+// `/mnt/nvmeof/launchers`): a single canonical root cannot express the jail.
+// Every configured root is canonicalized per request and roots that fail are
+// skipped (a missing GFS2 mount must not brick browsing); if none are usable
+// the endpoint answers 500. A request is allowed when its canonicalized target
+// starts with ANY canonical root, otherwise 403.
+//
+// Returned paths are LEXICAL, never canonical: `.` and `..` are resolved
+// textually and symlinks are left unresolved, so browsing
+// `/home/sean/repos/glm53-tensorfold-spark` echoes back exactly that string
+// (validated against `/mnt/nvmeof/repos/glm53-tensorfold-spark`) and the UI can
+// write it straight into the registry. `parent` is likewise lexical and is
+// null when the lexical path is (or normalizes to) a configured root.
+//
+// Error contract: 500 `{"error":"root unavailable"}`, 403
+// `{"error":"outside root"}`, 400 `{"error":"not a directory"}` (nonexistent,
+// non-directory, non-absolute).
+// ---------------------------------------------------------------------------
+
+const DEFAULT_FS_ROOTS: [&str; 2] = ["/home/sean", "/mnt/nvmeof"];
+const FS_LIST_MAX_ENTRIES: usize = 500;
+
+fn default_fs_roots() -> Vec<String> {
+    DEFAULT_FS_ROOTS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Configured browsable roots, in order. `CHRONOS_FS_ROOT` is a colon-separated
+/// list that replaces the defaults; blank entries are ignored, and a value that
+/// yields no entries at all (unset/empty/all-blank) falls back to the defaults.
+fn fs_roots() -> Vec<String> {
+    match std::env::var("CHRONOS_FS_ROOT") {
+        Ok(v) => {
+            let roots: Vec<String> = v
+                .split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if roots.is_empty() {
+                default_fs_roots()
+            } else {
+                roots
+            }
+        }
+        Err(_) => default_fs_roots(),
+    }
+}
+
+/// Resolve `.` and `..` purely textually (no filesystem access, no symlink
+/// following) while keeping the result absolute; `..` at the root is a no-op.
+/// Returns `None` for non-absolute input. This is the spelling handed back to
+/// the web UI because the registry already stores paths in that form.
+fn lexical_normalize(input: &str) -> Option<PathBuf> {
+    let path = FsPath::new(input);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) => {}
+            Component::RootDir => out.push("/"),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("/");
+    }
+    Some(out)
+}
+
+#[derive(Deserialize)]
+struct FsListQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+struct FsEntryItem {
+    name: String,
+    path: String,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
+async fn fs_list(Query(q): Query<FsListQuery>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Canonicalize each configured root; unusable ones are skipped rather than
+    // failing the request (a missing mount should not brick the other root).
+    let mut usable: Vec<(String, PathBuf)> = Vec::new();
+    for configured in fs_roots() {
+        let Some(lexical) = lexical_normalize(&configured) else {
+            continue;
+        };
+        let Ok(canon) = tokio::fs::canonicalize(&lexical).await else {
+            continue;
+        };
+        usable.push((lexical.to_string_lossy().to_string(), canon));
+    }
+    if usable.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "root unavailable" })),
+        ));
+    }
+
+    // No `path` → first usable configured root (the first configured root in
+    // normal operation).
+    let requested = match q.path.as_deref().map(str::trim) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => usable[0].0.clone(),
+    };
+    // Lexical target drives everything the client sees; `target` (canonical)
+    // drives validation and the actual read_dir.
+    let Some(lexical_target) = lexical_normalize(&requested) else {
+        return Err(bad_request("not a directory"));
+    };
+    let Ok(target) = tokio::fs::canonicalize(&lexical_target).await else {
+        return Err(bad_request("not a directory"));
+    };
+    if !usable.iter().any(|(_, canon)| target.starts_with(canon)) {
+        return Err((StatusCode::FORBIDDEN, Json(json!({ "error": "outside root" }))));
+    }
+    match tokio::fs::metadata(&target).await {
+        Ok(m) if m.is_dir() => {}
+        _ => return Err(bad_request("not a directory")),
+    }
+
+    let mut items: Vec<FsEntryItem> = Vec::new();
+    match tokio::fs::read_dir(&target).await {
+        Ok(mut rd) => {
+            while let Some(ent) = rd.next_entry().await.ok().flatten() {
+                let name = ent.file_name().to_string_lossy().to_string();
+                // Follow symlinks; unreadable entries (permissions, broken
+                // links) are skipped rather than failing the whole listing.
+                let Ok(md) = tokio::fs::metadata(ent.path()).await else {
+                    continue;
+                };
+                let is_dir = md.is_dir();
+                items.push(FsEntryItem {
+                    // Lexical child path: the parent spelling is preserved so
+                    // the UI can hand it straight back to /api/entries.
+                    path: lexical_target.join(&name).to_string_lossy().to_string(),
+                    name,
+                    is_dir,
+                    size: if is_dir { None } else { Some(md.len()) },
+                });
+            }
+        }
+        Err(_) => return Err(bad_request("not a directory")),
+    }
+
+    // Directories first, then files, alphabetical within each group.
+    items.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    items.truncate(FS_LIST_MAX_ENTRIES);
+
+    let at_root = usable
+        .iter()
+        .any(|(lexical, _)| FsPath::new(lexical.as_str()) == lexical_target.as_path());
+    let parent = if at_root {
+        Value::Null
+    } else {
+        lexical_target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| json!(p.to_string_lossy().to_string()))
+            .unwrap_or(Value::Null)
+    };
+    let entries: Vec<Value> = items
+        .into_iter()
+        .map(|i| {
+            json!({
+                "name": i.name,
+                "path": i.path,
+                "kind": if i.is_dir { "dir" } else { "file" },
+                "size": i.size,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "path": lexical_target.to_string_lossy().to_string(),
+        "parent": parent,
+        "entries": entries,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -673,6 +884,7 @@ async fn main() {
         .route("/api/entries/{id}/stop", post(stop_entry))
         .route("/api/entries/{id}/logs", get(entry_logs))
         .route("/api/cluster/drop-caches", post(drop_caches))
+        .route("/api/fs/list", get(fs_list))
         .with_state(state);
 
     match tokio::net::TcpListener::bind(&bind).await {

@@ -282,6 +282,7 @@ mod tests {
             probes: RwLock::new(Default::default()),
             states: RwLock::new(Default::default()),
             grace: std::sync::Mutex::new(Default::default()),
+            cpu_prev: std::sync::Mutex::new(Default::default()),
         })
     }
 

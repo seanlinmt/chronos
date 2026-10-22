@@ -83,6 +83,20 @@ pub struct NodeState {
     pub swap_total_bytes: Option<u64>,
     pub swap_used_bytes: Option<u64>,
     pub disk_root: Option<DiskInfo>,
+    /// Aggregate CPU busy percentage from /proc/stat deltas (None without a
+    /// previous sample).
+    #[serde(default)]
+    pub cpu_load_pct: Option<f64>,
+    /// Hottest valid /sys/class/thermal thermal_zone* sensor (CPU/SoC, °C).
+    #[serde(default)]
+    pub cpu_temp_c: Option<f64>,
+    /// nvidia-smi GPU temperature (°C).
+    #[serde(default)]
+    pub gpu_temp_c: Option<f64>,
+    /// nvidia-smi GPU utilization percentage (0–100, `None` when the driver
+    /// reports `[N/A]` or nvidia-smi is unavailable).
+    #[serde(default)]
+    pub gpu_load_pct: Option<f64>,
 }
 
 /// One entry in the published JSON state (shape fixed by spec).

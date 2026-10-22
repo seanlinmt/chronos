@@ -20,6 +20,9 @@ pub async fn probe_entry(e: &RegistryEntry, prev: &mut Prev, client: &reqwest::C
     match e.engine.as_str() {
         "tensorfold" => probe_tensorfold(e, &url, prev, client).await,
         "velogb10" => probe_velogb10(e, &url, prev, client).await,
+        // Unknown/new engines: treat as OpenAI-compatible (/v1/models) — the
+        // safest probe for an engine we have no bespoke implementation for.
+        "rust-embed" => probe_vllm(e, &url, prev, client).await,
         _ => probe_vllm(e, &url, prev, client).await,
     }
 }
@@ -41,6 +44,11 @@ const GENERIC_TOKENS: &[&str] = &[
     "sh", "ai", "ai2", "spark", "dgx", "2x", "4x", "flash", "next",
     "exl3", "tensorfold", "vllm", "velogb10", "home", "sean", "repos",
     "mnt", "nvmeof", "chat", "completions", "model", "models", "test",
+    // Engine-adjacent words: too generic to identify a served model, and they
+    // would otherwise cause false positives across entries sharing a port.
+    // ("embed" does not weaken the bge-m3 entries: their ids tokenize to
+    // "embedding"/"bge"/"m3", never the bare "embed".)
+    "rust", "embed",
 ];
 
 pub fn normalize_alphanumeric(s: &str) -> String {
