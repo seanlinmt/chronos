@@ -34,7 +34,7 @@ pub use collectors::{
 };
 pub use lifecycle::{
     add_entry, container_log_lines, drop_caches, entry_logs, log_file_tail, remove_entry,
-    spawn_detached, start_entry, stop_entry, DropCachesResult,
+    spawn_detached, start_entry, stop_entry, update_entry, DropCachesResult,
 };
 pub use model::{
     AppState, DiskInfo, EntrySnapshot, GraceKind, NodeState, Prev, ProbeResult, RegistryEntry,

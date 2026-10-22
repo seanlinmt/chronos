@@ -14,7 +14,8 @@ use crate::state::Shared;
 
 /// Spawn a lifecycle command fully detached (setsid, stdin null, output
 /// appended to the entry's log file) so quitting the TUI never kills children.
-pub async fn spawn_detached(cwd: &str, cmd: &str, log_path: &Path) -> Result<(), String> {
+/// Returns the child so callers can reap it (and react to early failure).
+pub async fn spawn_detached(cwd: &str, cmd: &str, log_path: &Path) -> Result<tokio::process::Child, String> {
     use std::process::Stdio;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -33,8 +34,28 @@ pub async fn spawn_detached(cwd: &str, cmd: &str, log_path: &Path) -> Result<(),
         .stdout(Stdio::from(file))
         .stderr(Stdio::from(stderr))
         .spawn()
-        .map_err(|e| format!("spawn `{cmd}` in {cwd}: {e}"))?;
-    Ok(())
+        .map_err(|e| format!("spawn `{cmd}` in {cwd}: {e}"))
+}
+
+/// Reap a detached child in the background (avoids zombies). When
+/// `clear_starting_grace` is set, a non-zero exit removes the entry's
+/// `Starting` grace so the UI flips to STOPPED immediately instead of
+/// waiting out the full grace window after a fast-failing launcher.
+fn watch_detached(
+    mut child: tokio::process::Child,
+    id: String,
+    shared: &Arc<Shared>,
+    clear_starting_grace: bool,
+) {
+    let sh = shared.clone();
+    tokio::spawn(async move {
+        if let Ok(status) = child.wait().await {
+            if clear_starting_grace && !status.success() {
+                sh.grace.lock().unwrap().remove(&id);
+                sh.publish();
+            }
+        }
+    });
 }
 
 fn find_entry(shared: &Shared, id: &str) -> Option<RegistryEntry> {
@@ -45,12 +66,13 @@ pub async fn start_entry(id: &str, shared: &Arc<Shared>) -> Result<String, Strin
     let e = find_entry(shared, id).ok_or_else(|| format!("entry `{id}` not found"))?;
     let log = log_file_for(&e.id);
     match spawn_detached(&e.path, &e.start, &log).await {
-        Ok(()) => {
+        Ok(child) => {
             shared
                 .grace
                 .lock()
                 .unwrap()
                 .insert(e.id.clone(), (GraceKind::Starting, Instant::now()));
+            watch_detached(child, e.id.clone(), shared, true);
             Ok(format!("started `{}` (logs: {})", e.id, log.display()))
         }
         Err(err) => Err(format!("start failed: {err}")),
@@ -61,12 +83,13 @@ pub async fn stop_entry(id: &str, shared: &Arc<Shared>) -> Result<String, String
     let e = find_entry(shared, id).ok_or_else(|| format!("entry `{id}` not found"))?;
     let log = log_file_for(&e.id);
     match spawn_detached(&e.path, &e.stop, &log).await {
-        Ok(()) => {
+        Ok(child) => {
             shared
                 .grace
                 .lock()
                 .unwrap()
                 .insert(e.id.clone(), (GraceKind::Stopping, Instant::now()));
+            watch_detached(child, e.id.clone(), shared, false);
             Ok(format!("stopping `{}` (logs: {})", e.id, log.display()))
         }
         Err(err) => Err(format!("stop failed: {err}")),
@@ -92,6 +115,49 @@ pub fn remove_entry(id: &str, shared: &Arc<Shared>) -> Result<String, String> {
     }
     save_registry(&reg).map(|_| format!("removed `{id}` from registry (files kept)"))
 }
+
+pub fn update_entry(old_id: &str, entry: RegistryEntry, shared: &Arc<Shared>) -> Result<String, String> {
+    let mut reg = shared.registry.write().unwrap();
+    let pos = reg
+        .iter()
+        .position(|e| e.id == old_id)
+        .ok_or_else(|| format!("entry `{old_id}` not found"))?;
+
+    if entry.id != old_id && reg.iter().any(|e| e.id == entry.id) {
+        return Err(format!("entry `{}` already exists", entry.id));
+    }
+
+    if entry.id != old_id {
+        {
+            let mut states = shared.states.write().unwrap();
+            if let Some(s) = states.remove(old_id) {
+                states.insert(entry.id.clone(), s);
+            }
+        }
+        {
+            let mut mem = shared.mem.write().unwrap();
+            if let Some(m) = mem.remove(old_id) {
+                mem.insert(entry.id.clone(), m);
+            }
+        }
+        {
+            let mut probes = shared.probes.write().unwrap();
+            if let Some(p) = probes.remove(old_id) {
+                probes.insert(entry.id.clone(), p);
+            }
+        }
+        {
+            let mut grace = shared.grace.lock().unwrap();
+            if let Some(g) = grace.remove(old_id) {
+                grace.insert(entry.id.clone(), g);
+            }
+        }
+    }
+
+    reg[pos] = entry.clone();
+    save_registry(&reg).map(|_| format!("updated `{}` in registry", entry.id))
+}
+
 
 /// Result of a drop-caches pass; `ai`/`ai2` are pre-formatted status strings
 /// ("ok", "failed (...)", "error: ...", "timed out").
@@ -196,4 +262,112 @@ pub async fn entry_logs(id: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::RwLock;
+    use tokio::sync::watch;
+    use crate::model::AppState;
+
+    fn mock_shared(entries: Vec<RegistryEntry>) -> Arc<Shared> {
+        let (tx, _rx) = watch::channel(Arc::new(AppState::default()));
+        Arc::new(Shared {
+            tx,
+            registry: RwLock::new(entries),
+            storage: RwLock::new(Default::default()),
+            nodes: RwLock::new(Default::default()),
+            mem: RwLock::new(Default::default()),
+            probes: RwLock::new(Default::default()),
+            states: RwLock::new(Default::default()),
+            grace: std::sync::Mutex::new(Default::default()),
+        })
+    }
+
+    fn sample_entry(id: &str, port: u16) -> RegistryEntry {
+        RegistryEntry {
+            id: id.into(),
+            path: format!("/path/{id}"),
+            start: "./start.sh".into(),
+            stop: "./stop.sh".into(),
+            host: "192.168.20.63".into(),
+            port,
+            slot: "primary-llm".into(),
+            engine: "vllm".into(),
+            containers: vec![],
+            process_match: None,
+        }
+    }
+
+    #[test]
+    fn test_update_entry_fields() {
+        let tmp = std::env::temp_dir().join(format!("chronos_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        unsafe { std::env::set_var("CHRONOS_HOME", tmp.to_str().unwrap()); }
+
+        let e1 = sample_entry("e1", 8888);
+        let shared = mock_shared(vec![e1]);
+
+        let mut updated = sample_entry("e1", 8899);
+        updated.path = "/new/path".into();
+        let res = update_entry("e1", updated.clone(), &shared);
+        assert!(res.is_ok(), "{res:?}");
+
+        let reg = shared.registry.read().unwrap();
+        assert_eq!(reg.len(), 1);
+        assert_eq!(reg[0].port, 8899);
+        assert_eq!(reg[0].path, "/new/path");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_update_entry_rename_and_conflict() {
+        let tmp = std::env::temp_dir().join(format!("chronos_test_rename_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        unsafe { std::env::set_var("CHRONOS_HOME", tmp.to_str().unwrap()); }
+
+        let e1 = sample_entry("e1", 8888);
+        let e2 = sample_entry("e2", 8889);
+        let shared = mock_shared(vec![e1, e2]);
+        shared.states.write().unwrap().insert("e1".into(), "RUNNING".into());
+
+        // Attempt to rename e1 to e2 -> conflict
+        let conflicting = sample_entry("e2", 8888);
+        let res = update_entry("e1", conflicting, &shared);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("already exists"));
+
+        // Rename e1 to e3 -> success
+        let renamed = sample_entry("e3", 8888);
+        let res = update_entry("e1", renamed, &shared);
+        assert!(res.is_ok());
+
+        let reg = shared.registry.read().unwrap();
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg[0].id, "e3");
+        assert_eq!(reg[1].id, "e2");
+
+        let states = shared.states.read().unwrap();
+        assert_eq!(states.get("e3").map(String::as_str), Some("RUNNING"));
+        assert_eq!(states.get("e1"), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_update_entry_not_found() {
+        let tmp = std::env::temp_dir().join(format!("chronos_test_nf_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        unsafe { std::env::set_var("CHRONOS_HOME", tmp.to_str().unwrap()); }
+
+        let shared = mock_shared(vec![]);
+        let e = sample_entry("missing", 8888);
+        let res = update_entry("missing", e, &shared);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("not found"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

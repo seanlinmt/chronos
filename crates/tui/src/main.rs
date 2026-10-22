@@ -45,10 +45,14 @@ struct AddModal {
     port: String,
     slot: String,
     engine: String,
+    host: String,
+    containers: Vec<String>,
+    process_match: Option<String>,
     focus: usize,
     note: Option<String>,
     detected_start: Option<String>,
     detected_stop: Option<String>,
+    editing_id: Option<String>,
 }
 
 impl AddModal {
@@ -59,12 +63,35 @@ impl AddModal {
             port: "8888".into(),
             slot: "primary-llm".into(),
             engine: "vllm".into(),
+            host: AI_LAN.into(),
+            containers: vec![],
+            process_match: None,
             focus: 0,
             note: None,
             detected_start: None,
             detected_stop: None,
+            editing_id: None,
         }
     }
+
+    fn edit(entry: &RegistryEntry) -> Self {
+        AddModal {
+            path: entry.path.clone(),
+            id: entry.id.clone(),
+            port: entry.port.to_string(),
+            slot: entry.slot.clone(),
+            engine: entry.engine.clone(),
+            host: entry.host.clone(),
+            containers: entry.containers.clone(),
+            process_match: entry.process_match.clone(),
+            focus: 0,
+            note: None,
+            detected_start: if entry.start.is_empty() { None } else { Some(entry.start.clone()) },
+            detected_stop: if entry.stop.is_empty() { None } else { Some(entry.stop.clone()) },
+            editing_id: Some(entry.id.clone()),
+        }
+    }
+
     fn fields(&mut self) -> [&mut String; 5] {
         [
             &mut self.path,
@@ -74,7 +101,15 @@ impl AddModal {
             &mut self.engine,
         ]
     }
+
     fn build(&self) -> RegistryEntry {
+        let host = if !self.host.is_empty() {
+            self.host.clone()
+        } else if self.path.starts_with("/mnt/nvmeof") {
+            AI2_LAN.to_string()
+        } else {
+            AI_LAN.to_string()
+        };
         RegistryEntry {
             id: if self.id.trim().is_empty() {
                 "unnamed-entry".into()
@@ -84,17 +119,12 @@ impl AddModal {
             path: self.path.trim().to_string(),
             start: self.detected_start.clone().unwrap_or_default(),
             stop: self.detected_stop.clone().unwrap_or_default(),
-            host: if self.path.starts_with("/mnt/nvmeof") {
-                AI2_LAN
-            } else {
-                AI_LAN
-            }
-            .to_string(),
+            host,
             port: self.port.trim().parse().unwrap_or(8888),
             slot: self.slot.trim().to_string(),
             engine: self.engine.trim().to_string(),
-            containers: vec![],
-            process_match: None,
+            containers: self.containers.clone(),
+            process_match: self.process_match.clone(),
         }
     }
 }
@@ -118,6 +148,7 @@ enum Action {
     Start(String),
     Stop(String),
     Add(RegistryEntry),
+    Update(String, RegistryEntry),
     Remove(String),
     DropCaches,
     ShowLog(String),
@@ -193,7 +224,7 @@ fn detect_launch(path: &str) -> (Option<String>, Option<String>, Option<String>,
 // 2. DRAWING
 // =============================================================================
 
-const KEYBAR: &str = "s start · x stop · l logs · a add · d del · c drop-caches · r refresh · q/Esc quit";
+const KEYBAR: &str = "s start · x stop · l logs · a add · e edit · d del · c drop-caches · r refresh · q/Esc quit";
 
 fn draw(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState) {
     let area = f.area();
@@ -568,11 +599,16 @@ fn draw_add_modal(f: &mut Frame, m: &AddModal, area: ratatui::layout::Rect) {
         "Tab next field (auto-detects scripts/.env from Path) · Enter save · Esc cancel",
         Style::default().fg(Color::DarkGray),
     )));
+    let title = if let Some(id) = &m.editing_id {
+        format!("EDIT REPOSITORY ENTRY: {id}")
+    } else {
+        "ADD REPOSITORY ENTRY".to_string()
+    };
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("ADD REPOSITORY ENTRY"),
+                .title(title),
         ),
         r,
     );
@@ -598,6 +634,7 @@ fn handle_key(
     ui: &mut UiState,
     app: &chronos_core::AppState,
     action_tx: &mpsc::UnboundedSender<Action>,
+    collector: &Collector,
 ) {
     if key.kind != KeyEventKind::Press {
         return;
@@ -644,8 +681,13 @@ fn handle_key(
                     let _ = model;
                 } else {
                     let entry = m.build();
+                    let editing_id = m.editing_id.clone();
                     ui.add_modal = None;
-                    let _ = action_tx.send(Action::Add(entry));
+                    if let Some(old_id) = editing_id {
+                        let _ = action_tx.send(Action::Update(old_id, entry));
+                    } else {
+                        let _ = action_tx.send(Action::Add(entry));
+                    }
                 }
             }
             KeyCode::Backspace => {
@@ -731,6 +773,18 @@ fn handle_key(
                 ui.add_modal = Some(AddModal::new());
             }
         }
+        KeyCode::Char('e') => {
+            if let Some(e) = app.entries.get(ui.selected) {
+                if let Some(reg_entry) = collector.find(&e.id) {
+                    ui.add_modal = Some(AddModal::edit(&reg_entry));
+                } else {
+                    ui.message = Some((
+                        format!("entry `{}` not found in registry", e.id),
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
         KeyCode::Char('c') => {
             let _ = action_tx.send(Action::DropCaches);
             ui.message = Some(("drop caches requested…".into(), Instant::now()));
@@ -769,6 +823,10 @@ async fn run_action(action: Action, collector: &Collector, ui_tx: &mpsc::Unbound
         Action::Add(entry) => {
             let msg = collector.add(entry).await.unwrap_or_else(|e| e);
             // Next publish tick picks up the new entry.
+            let _ = ui_tx.send(UiMsg::Message(msg));
+        }
+        Action::Update(old_id, entry) => {
+            let msg = collector.update(&old_id, entry).await.unwrap_or_else(|e| e);
             let _ = ui_tx.send(UiMsg::Message(msg));
         }
         Action::Remove(id) => {
@@ -848,7 +906,7 @@ async fn run_tui() {
                 if ui.should_quit {
                     break;
                 }
-                handle_key(key, &mut ui, &app, &action_tx);
+                handle_key(key, &mut ui, &app, &action_tx, &collector);
             }
         }
         if ui.should_quit {

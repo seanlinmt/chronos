@@ -44,7 +44,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             id: "launch-embedding-ai.sh (BGE-M3)".into(),
             path: "/mnt/nvmeof/launchers".into(),
-            start: "./launch-embedding-ai.sh".into(),
+            start: "./launch-embedding-ai.sh --force".into(),
             stop: "docker rm -f vllm_bge_m3".into(),
             host: AI_LAN.into(),
             port: 8891,
@@ -56,7 +56,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
         RegistryEntry {
             id: "launch-reranker-ai2.sh (BGE-Reranker-v2-M3)".into(),
             path: "/mnt/nvmeof/launchers".into(),
-            start: "./launch-reranker-ai2.sh".into(),
+            start: "./launch-reranker-ai2.sh --force".into(),
             stop: "ssh -o BatchMode=yes ai2 'docker rm -f vllm_bge_reranker'".into(),
             host: AI2_LAN.into(),
             port: 8892,

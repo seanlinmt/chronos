@@ -212,6 +212,7 @@ fn entry_dto(e: &RegistryEntry, snap: Option<&chronos_core::EntrySnapshot>, web:
         "containers": e.containers,
         "process_match": e.process_match,
         "status": status,
+        "status_detail": snap.and_then(|s| s.status_detail.clone()),
         "uptime_s": uptime,
         "served_model": snap.and_then(|s| s.served_model.clone()),
         "mem_ai_bytes": mem_ai_v,
@@ -269,7 +270,7 @@ struct EntryInput {
     #[serde(default = "default_port")]
     port: u16,
     #[serde(default)]
-    slot: String,
+    slot: Option<String>,
     #[serde(default = "default_engine")]
     engine: String,
     #[serde(default)]
@@ -307,15 +308,15 @@ async fn add_entry(
     .to_string();
     let entry = RegistryEntry {
         id,
-        path: input.path,
-        start: input.start_cmd,
-        stop: input.stop_cmd,
-        host: input.host,
+        path: input.path.trim().to_string(),
+        start: input.start_cmd.trim().to_string(),
+        stop: input.stop_cmd.trim().to_string(),
+        host: input.host.trim().to_string(),
         port: input.port,
-        slot: input.slot,
+        slot: input.slot.unwrap_or_default().trim().to_string(),
         engine,
         containers: input.containers,
-        process_match: input.process_match,
+        process_match: input.process_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     };
 
     if state.collector.find(&entry.id).is_some() {
@@ -330,6 +331,82 @@ async fn add_entry(
         .add(entry.clone())
         .await
         .map_err(|e| (StatusCode::CONFLICT, Json(json!({ "error": e }))))?;
+    Ok(Json(dto))
+}
+
+async fn update_entry(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<EntryInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if input.path.trim().is_empty() {
+        return Err(bad_request("path is required"));
+    }
+    if state.collector.find(&id).is_none() {
+        return Err((StatusCode::NOT_FOUND, Json(json!({ "error": "unknown entry" }))));
+    }
+
+    let new_id = if input.name.trim().is_empty() || input.name.trim() == id {
+        id.clone()
+    } else {
+        let s = slugify(&input.name);
+        if s.is_empty() {
+            id.clone()
+        } else {
+            s
+        }
+    };
+
+    if new_id != id && state.collector.find(&new_id).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("entry '{new_id}' already exists") })),
+        ));
+    }
+
+    let engine = match input.engine.as_str() {
+        "tensorfold" => "tensorfold",
+        "velogb10" => "velogb10",
+        _ => "vllm",
+    }
+    .to_string();
+
+    let entry = RegistryEntry {
+        id: new_id.clone(),
+        path: input.path.trim().to_string(),
+        start: input.start_cmd.trim().to_string(),
+        stop: input.stop_cmd.trim().to_string(),
+        host: if input.host.trim().is_empty() {
+            default_host()
+        } else {
+            input.host.trim().to_string()
+        },
+        port: if input.port == 0 { default_port() } else { input.port },
+        slot: input.slot.unwrap_or_default().trim().to_string(),
+        engine,
+        containers: input.containers,
+        process_match: input.process_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+    };
+
+    if new_id != id {
+        let mut web = state.web.lock().unwrap();
+        if let Some(since) = web.running_since.remove(&id) {
+            web.running_since.insert(new_id.clone(), since);
+        }
+        if let Some(at) = web.stopping.remove(&id) {
+            web.stopping.insert(new_id.clone(), at);
+        }
+    }
+
+    state
+        .collector
+        .update(&id, entry.clone())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))))?;
+
+    let snap = state.collector.snapshot();
+    let s = snap.entries.iter().find(|s| s.id == entry.id);
+    let dto = entry_dto(&entry, s, &mut state.web.lock().unwrap(), now_unix());
     Ok(Json(dto))
 }
 
@@ -591,7 +668,7 @@ async fn main() {
         .route("/api/state", get(api_state))
         .route("/api/entries", post(add_entry))
         .route("/api/entries/inspect", post(inspect_entry))
-        .route("/api/entries/{id}", delete(delete_entry))
+        .route("/api/entries/{id}", delete(delete_entry).put(update_entry).post(update_entry))
         .route("/api/entries/{id}/start", post(start_entry))
         .route("/api/entries/{id}/stop", post(stop_entry))
         .route("/api/entries/{id}/logs", get(entry_logs))

@@ -109,7 +109,10 @@
   th { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
   tbody tr:hover { background: rgba(79,156,249,.05); }
   td.acts { white-space: nowrap; }
-  td.acts .btn { margin-right: 4px; }
+  td.acts .btn { margin-right: 4px; min-width: 78px; }
+  /* Reserve the slot of inapplicable buttons so the column never reflows
+     when status changes (STOPPED→STARTING→RUNNING). */
+  td.acts .btn.ghosted { visibility: hidden; }
 
   /* ---- endpoint cards ---- */
   .ep-card { display: flex; flex-direction: column; gap: 10px; }
@@ -585,7 +588,6 @@ function renderActive(entries) {
       el('div', { class: 'row' },
         el('h3', { class: 'mono' }, e.name),
         el('div', { class: 'spacer' }),
-        e.status === 'STARTING' ? el('span', { class: 'badge STARTING' }, 'starting…') : null,
         statusBadge(e.status)),
       el('div', { class: 'muted small mono' },
         `serving: ${e.served_model || e.name} · ${e.host}:${e.port} · up ${fmtUptime(e.uptime_s)}`),
@@ -595,6 +597,7 @@ function renderActive(entries) {
         epStat('Concurrent Requests', el('span', {}, conc, queued ? el('span', { class: 'muted' }, queued) : null))),
       el('div', { class: 'row', style: 'justify-content:flex-end' },
         el('button', { class: 'btn', type: 'button', onclick: () => openLogs(e.id, e.name) }, 'Logs'),
+        el('button', { class: 'btn', type: 'button', onclick: () => openEdit(e) }, 'Edit'),
         el('button', {
           class: 'btn danger' + (stopBusy ? ' busy' : ''), type: 'button',
           onclick: () => stopEntry(e.id, e.name),
@@ -605,10 +608,10 @@ function renderActive(entries) {
 
 /* ============================ registry table ============================ */
 
-function actionBtn(id, key, label, cls, title, onClick) {
+function actionBtn(id, key, label, cls, title, onClick, hidden) {
   const isBusy = busy.has(`${id}:${key}`);
   const b = el('button', {
-    class: `btn ${cls || ''}` + (isBusy ? ' busy' : ''),
+    class: `btn ${cls || ''}` + (isBusy ? ' busy' : '') + (hidden ? ' ghosted' : ''),
     type: 'button',
     onclick: () => onClick(id),
   }, label);
@@ -623,7 +626,12 @@ function renderTable(entries, storage) {
   const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name));
 
   for (const e of sorted) {
-    const startDisabled = e.status === 'RUNNING' || busy.has(`${e.id}:start`);
+    // All action slots are always rendered (inapplicable ones ghosted) so
+    // the ACTIONS column width never changes with status — no row reflow when
+    // Start/Stop appear or disappear.
+    const startHidden = e.status === 'RUNNING';
+    const stopHidden = !(e.status === 'RUNNING' || e.status === 'STARTING');
+    const startDisabled = startHidden || e.status === 'STARTING' || busy.has(`${e.id}:start`);
     const tr = el('tr', {},
       el('td', { class: 'mono' }, e.name),
       el('td', { class: 'muted mono', title: e.path }, truncMid(e.path)),
@@ -632,19 +640,16 @@ function renderTable(entries, storage) {
       el('td', { class: 'mono' }, e.engine || '—'),
       el('td', {}, statusBadge(e.status)),
       el('td', { class: 'acts' },
-        (e.status !== 'RUNNING')
-          ? actionBtn(e.id, 'start', 'Start', '', offline ? 'Storage offline' : '', (id) => startEntry(id))
-          : null,
-        (e.status === 'RUNNING' || e.status === 'STARTING')
-          ? actionBtn(e.id, 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name))
-          : null,
+        actionBtn(e.id, 'start', 'Start', '', offline ? 'Storage offline' : '', (id) => startEntry(id), startHidden),
+        actionBtn(e.id, 'stop', 'Stop', 'danger', '', (id) => stopEntry(id, e.name), stopHidden),
         actionBtn(e.id, 'logs', 'Logs', '', '', (id) => openLogs(id, e.name)),
+        actionBtn(e.id, 'edit', 'Edit', '', '', () => openEdit(e)),
         actionBtn(e.id, 'remove', 'Remove', 'danger', '', (id) => removeEntry(id, e.name))));
 
     const startBtn = tr.querySelector('td.acts .btn');
     if (startDisabled && startBtn && startBtn.textContent === 'Start') {
       startBtn.disabled = true;
-      if (!offline) startBtn.title = 'starting…';
+      if (e.status === 'STARTING') startBtn.title = 'starting…';
     }
     body.append(tr);
   }
@@ -700,15 +705,49 @@ async function removeEntry(id, name) {
 /* ============================ add modal ============================ */
 
 const addOverlay = $('#addoverlay');
+let editTarget = null;
 
 function openAdd() {
+  editTarget = null;
+  $('#addtitle').textContent = 'Add Repo / Launcher';
+  $('#btn-register').textContent = 'Register';
   $('#add-err').textContent = '';
+  $('#f-path').value = '';
+  $('#f-name').value = '';
+  $('#f-start').value = '';
+  $('#f-stop').value = '';
+  $('#f-host').value = '192.168.20.63';
+  $('#f-port').value = '8888';
+  $('#f-slot').value = '';
+  $('#f-engine').value = 'vllm';
+  $('#f-containers').value = '';
+  $('#f-procmatch').value = '';
   addOverlay.classList.add('open');
   $('#f-path').focus();
 }
 
+function openEdit(e) {
+  editTarget = e.id;
+  $('#addtitle').textContent = `Edit — ${e.name || e.id}`;
+  $('#btn-register').textContent = 'Save Changes';
+  $('#add-err').textContent = '';
+  $('#f-path').value = e.path || '';
+  $('#f-name').value = e.name || e.id || '';
+  $('#f-start').value = e.start_cmd || '';
+  $('#f-stop').value = e.stop_cmd || '';
+  $('#f-host').value = e.host || '192.168.20.63';
+  $('#f-port').value = e.port != null ? e.port : 8888;
+  $('#f-slot').value = e.slot || '';
+  $('#f-engine').value = e.engine || 'vllm';
+  $('#f-containers').value = Array.isArray(e.containers) ? e.containers.join(', ') : '';
+  $('#f-procmatch').value = e.process_match || '';
+  addOverlay.classList.add('open');
+  $('#f-name').focus();
+}
+
 function closeAdd() {
   addOverlay.classList.remove('open');
+  editTarget = null;
 }
 
 function addFormBody() {
@@ -751,7 +790,7 @@ async function autoDetect() {
     if (s.engine) $('#f-engine').value = s.engine;
     $('#f-containers').value = Array.isArray(s.containers) ? s.containers.join(', ') : '';
     $('#f-procmatch').value = s.process_match || '';
-    toast('Auto-detect complete — review fields and register.', 'ok');
+    toast('Auto-detect complete — review fields and save.', 'ok');
   } catch (e) {
     errEl.textContent = `Auto-detect failed: ${e.message}`;
   } finally {
@@ -768,15 +807,29 @@ async function register() {
   const btn = $('#btn-register');
   btn.classList.add('busy');
   try {
-    await api('/api/entries', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    closeAdd();
-    toast(`Registered ${body.name}`);
+    if (editTarget) {
+      await api(`/api/entries/${encodeURIComponent(editTarget)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      closeAdd();
+      toast(`Updated ${body.name}`);
+    } else {
+      await api('/api/entries', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      closeAdd();
+      toast(`Registered ${body.name}`);
+    }
+    const data = await api('/api/state');
+    lastData = data;
+    renderAll(data);
   } catch (e) {
-    errEl.textContent = `Register failed${e.status === 409 ? ' (already registered)' : ''}: ${e.message}`;
+    const action = editTarget ? 'Save' : 'Register';
+    errEl.textContent = `${action} failed${e.status === 409 ? ' (already exists)' : ''}: ${e.message}`;
   } finally {
     btn.classList.remove('busy');
   }

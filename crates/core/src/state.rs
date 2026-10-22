@@ -247,11 +247,21 @@ impl Collector {
     }
 
     pub async fn add(&self, entry: RegistryEntry) -> Result<String, String> {
-        crate::lifecycle::add_entry(entry, &self.shared)
+        let r = crate::lifecycle::add_entry(entry, &self.shared);
+        self.shared.publish();
+        r
     }
 
     pub async fn remove(&self, id: &str) -> Result<String, String> {
-        crate::lifecycle::remove_entry(id, &self.shared)
+        let r = crate::lifecycle::remove_entry(id, &self.shared);
+        self.shared.publish();
+        r
+    }
+
+    pub async fn update(&self, old_id: &str, entry: RegistryEntry) -> Result<String, String> {
+        let r = crate::lifecycle::update_entry(old_id, entry, &self.shared);
+        self.shared.publish();
+        r
     }
 
     pub async fn drop_caches(&self) -> crate::lifecycle::DropCachesResult {

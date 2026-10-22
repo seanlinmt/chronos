@@ -1,6 +1,6 @@
-//! Engine probes: tensorfold /health, vllm /v1/models + /metrics (with HTTP
-//! status checks BEFORE parsing bodies — a shared host:port may answer 401
-//! with a valid JSON error body), velogb10 /health, Prev-counter deltas.
+//! Engine probes: tensorfold, vllm, velogb10.
+//! Probes verify BOTH port reachable AND model name matches the entry,
+//! preventing port collisions (e.g. on shared port 8888).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -32,13 +32,169 @@ fn fail_probe(msg: String) -> ProbeResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Model name matching: verifies that host:port is serving the expected model
+// ---------------------------------------------------------------------------
+
+const GENERIC_TOKENS: &[&str] = &[
+    "launch", "launcher", "launchers", "start", "stop", "server", "serve",
+    "sh", "ai", "ai2", "spark", "dgx", "2x", "4x", "flash", "next",
+    "exl3", "tensorfold", "vllm", "velogb10", "home", "sean", "repos",
+    "mnt", "nvmeof", "chat", "completions", "model", "models", "test",
+];
+
+pub fn normalize_alphanumeric(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+pub fn extract_identifying_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for part in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+        let p = part.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        if p.contains('.') {
+            let collapsed: String = p.chars().filter(|c| *c != '.').collect();
+            if collapsed.len() >= 3 && !GENERIC_TOKENS.contains(&collapsed.as_str()) {
+                tokens.push(collapsed);
+            }
+        }
+        let clean: String = p.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if clean.len() >= 3 && !GENERIC_TOKENS.contains(&clean.as_str()) {
+            tokens.push(clean);
+        }
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+pub fn model_matches_entry(e: &RegistryEntry, served_models: &[String]) -> bool {
+    if served_models.is_empty() {
+        return false;
+    }
+
+    let norm_entry = normalize_alphanumeric(&format!("{} {}", e.id, e.path));
+    let entry_tokens = extract_identifying_tokens(&format!("{} {}", e.id, e.path));
+
+    for model_id in served_models {
+        let norm_model = normalize_alphanumeric(model_id);
+        if norm_model.is_empty() {
+            continue;
+        }
+
+        // Reranker disambiguation: reranker entries only match reranker models.
+        if norm_entry.contains("rerank") != norm_model.contains("rerank") {
+            continue;
+        }
+
+        // Direct containment on full normalized strings.
+        if !norm_entry.is_empty() && (norm_entry.contains(&norm_model) || norm_model.contains(&norm_entry)) {
+            return true;
+        }
+
+        // Match if any non-generic token from entry is in the normalized model name.
+        for t in &entry_tokens {
+            if norm_model.contains(t) {
+                return true;
+            }
+        }
+
+        // Match if any non-generic token from the model name is in the entry.
+        let model_tokens = extract_identifying_tokens(model_id);
+        for mt in &model_tokens {
+            if norm_entry.contains(mt) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+async fn find_api_key(path: &str) -> Option<String> {
+    for rel in ["config/prod.env", ".env", ".env.local"] {
+        let p = format!("{path}/{rel}");
+        if let Ok(content) = tokio::fs::read_to_string(&p).await {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("API_KEY=") {
+                    let key = rest.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() {
+                        return Some(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn fetch_v1_models(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut req = client.get(format!("{url}/v1/models"));
+    if let Some(k) = api_key {
+        req = req.header("Authorization", format!("Bearer {k}"));
+    }
+    let r = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return Err(format!("http: {e}")),
+    };
+    let status = r.status();
+    if !status.is_success() {
+        return Err(format!("models http {status}"));
+    }
+    let body: Value = match r.json().await {
+        Ok(v) => v,
+        Err(e) => return Err(format!("models json: {e}")),
+    };
+    let list: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(list)
+}
+
+// ---------------------------------------------------------------------------
+// Engine Probes
+// ---------------------------------------------------------------------------
+
 async fn probe_tensorfold(
-    _e: &RegistryEntry,
+    e: &RegistryEntry,
     url: &str,
     prev: &mut Prev,
     client: &reqwest::Client,
 ) -> ProbeResult {
     let now = Instant::now();
+    let api_key = find_api_key(&e.path).await;
+
+    // 1. Check served model name on /v1/models (requires auth if configured with API key).
+    let models = match fetch_v1_models(client, url, api_key.as_deref()).await {
+        Ok(m) => m,
+        Err(err) => return fail_probe(err),
+    };
+
+    let served = models.first().cloned();
+    if !model_matches_entry(e, &models) {
+        return fail_probe(format!(
+            "serving '{}'",
+            served.as_deref().unwrap_or("unknown")
+        ));
+    }
+
+    // 2. Telemetry and health check from /health.
     let v: Value = match client.get(format!("{url}/health")).send().await {
         Ok(r) => {
             let status = r.status();
@@ -52,17 +208,26 @@ async fn probe_tensorfold(
         }
         Err(e) => return fail_probe(format!("http: {e}")),
     };
-    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    let ok = v
+        .get("ok")
+        .and_then(|x| x.as_bool())
+        .or_else(|| v.get("status").and_then(|x| x.as_str()).map(|s| s == "ok"))
+        .unwrap_or(false);
     if !ok {
         return fail_probe("health ok=false".into());
     }
+    let live_obj = v.get("live");
     let total = jnum(&v, "completion_tokens_total");
     let decode = jf(&v, "decode_seconds_total");
-    let concurrent = jnum(&v, "requests_running").or_else(|| jnum(&v, "inflight"));
+    let concurrent = jnum(&v, "requests_running")
+        .or_else(|| jnum(&v, "inflight"))
+        .or_else(|| live_obj.and_then(|l| jnum(l, "connections")));
+    let queued = jnum(&v, "queued")
+        .or_else(|| live_obj.and_then(|l| jnum(l, "waiting")));
     let live = match (prev.total, total, prev.decode_s, decode) {
         (Some(pt), Some(nt), Some(pd), Some(nd)) if nd > pd => Some((nt - pt) as f64 / (nd - pd)),
         (Some(_), Some(_), _, _) => Some(0.0),
-        _ => None,
+        _ => live_obj.and_then(|l| jf(l, "decode_tokens_per_second")),
     };
     let lifetime = match (total, decode) {
         (Some(t), Some(d)) if d > 0.0 => Some(t as f64 / d),
@@ -74,12 +239,13 @@ async fn probe_tensorfold(
         decode_s: decode,
         at: if p.at.is_some() { p.at } else { Some(now) },
     };
+    let served = served.or_else(|| v.get("model").and_then(|x| x.as_str()).map(|s| s.to_string()));
     ProbeResult {
         ok: true,
         detail: None,
-        served_model: None,
+        served_model: served,
         concurrent,
-        queued: None,
+        queued,
         live_tok_per_sec: live,
         lifetime_decode: lifetime,
         total_tokens: total,
@@ -101,31 +267,21 @@ fn parse_prom_metric(text: &str, key: &str) -> Option<f64> {
         })
 }
 
-pub async fn probe_vllm(_e: &RegistryEntry, url: &str, prev: &mut Prev, client: &reqwest::Client) -> ProbeResult {
+pub async fn probe_vllm(e: &RegistryEntry, url: &str, prev: &mut Prev, client: &reqwest::Client) -> ProbeResult {
     let now = Instant::now();
-    // Liveness + served model name. NOTE: must check HTTP status — another
-    // engine may share this host:port and answer 401 with a JSON error body
-    // (parses fine but is NOT liveness).
-    let models: Value = match client.get(format!("{url}/v1/models")).send().await {
-        Ok(r) => {
-            let status = r.status();
-            if !status.is_success() {
-                return fail_probe(format!("models http {status}"));
-            }
-            match r.json().await {
-                Ok(v) => v,
-                Err(e) => return fail_probe(format!("models json: {e}")),
-            }
-        }
-        Err(err) => return fail_probe(format!("http: {err}")),
+    // Liveness + served model name.
+    let models = match fetch_v1_models(client, url, None).await {
+        Ok(m) => m,
+        Err(err) => return fail_probe(err),
     };
-    let served = models
-        .get("data")
-        .and_then(|d| d.as_array())
-        .and_then(|a| a.first())
-        .and_then(|m| m.get("id"))
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string());
+
+    let served = models.first().cloned();
+    if !model_matches_entry(e, &models) {
+        return fail_probe(format!(
+            "serving '{}'",
+            served.as_deref().unwrap_or("unknown")
+        ));
+    }
 
     // Metrics are best-effort (may be disabled); only trust a 2xx body.
     let metrics: Option<String> = match client.get(format!("{url}/metrics")).send().await {
@@ -177,12 +333,23 @@ pub async fn probe_vllm(_e: &RegistryEntry, url: &str, prev: &mut Prev, client: 
 }
 
 async fn probe_velogb10(
-    _e: &RegistryEntry,
+    e: &RegistryEntry,
     url: &str,
     prev: &mut Prev,
     client: &reqwest::Client,
 ) -> ProbeResult {
     let now = Instant::now();
+
+    // Check model name on /v1/models if available.
+    let models = fetch_v1_models(client, url, None).await.ok().unwrap_or_default();
+    let served = models.first().cloned();
+    if !models.is_empty() && !model_matches_entry(e, &models) {
+        return fail_probe(format!(
+            "serving '{}'",
+            served.as_deref().unwrap_or("unknown")
+        ));
+    }
+
     let v: Value = match client.get(format!("{url}/health")).send().await {
         Ok(r) => {
             let status = r.status();
@@ -237,7 +404,7 @@ async fn probe_velogb10(
     ProbeResult {
         ok: true,
         detail: None,
-        served_model: None,
+        served_model: served,
         concurrent: None,
         queued: None,
         live_tok_per_sec: live,
@@ -273,4 +440,144 @@ pub async fn probe_all(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::RegistryEntry;
+
+    fn make_entry(id: &str, path: &str, port: u16) -> RegistryEntry {
+        RegistryEntry {
+            id: id.into(),
+            path: path.into(),
+            start: String::new(),
+            stop: String::new(),
+            host: "192.168.20.63".into(),
+            port,
+            slot: "primary-llm".into(),
+            engine: "tensorfold".into(),
+            containers: vec![],
+            process_match: None,
+        }
+    }
+
+    #[test]
+    fn test_deepseek_matches_deepseek_entry() {
+        let e = make_entry(
+            "DeepSeek-v4.1-Flash-2x-DGX-Spark",
+            "/home/sean/repos/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+            8888,
+        );
+        let models = vec![
+            "deepseek-v41-flash-exl3".to_string(),
+            "DeepSeek-V4.1-Flash-1017".to_string(),
+        ];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_deepseek_rejects_glm53_entry() {
+        let e = make_entry(
+            "glm53-tensorfold-spark",
+            "/home/sean/repos/glm53-tensorfold-spark",
+            8888,
+        );
+        let models = vec![
+            "deepseek-v41-flash-exl3".to_string(),
+            "DeepSeek-V4.1-Flash-1017".to_string(),
+        ];
+        assert!(!model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_glm_matches_glm_entry() {
+        let e = make_entry(
+            "glm53-tensorfold-spark",
+            "/home/sean/repos/glm53-tensorfold-spark",
+            8888,
+        );
+        let models = vec!["GLM-5.3-Flash-EXL3".to_string()];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_glm_rejects_deepseek_entry() {
+        let e = make_entry(
+            "DeepSeek-v4.1-Flash-2x-DGX-Spark",
+            "/home/sean/repos/DeepSeek-v4.1-Flash-2x-DGX-Spark",
+            8888,
+        );
+        let models = vec!["GLM-5.3-Flash-EXL3".to_string()];
+        assert!(!model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_qwen_matches_velogb10() {
+        let e = make_entry(
+            "veloGB10 (Qwen3.8-Flash-Next)",
+            "/home/sean/repos/veloGB10",
+            8888,
+        );
+        let models = vec!["qwen3.8-flash-next".to_string()];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_bge_m3_matches_embedding() {
+        let e = make_entry(
+            "launch-embedding-ai.sh (BGE-M3)",
+            "/mnt/nvmeof/launchers",
+            8891,
+        );
+        let models = vec!["BAAI/bge-m3".to_string()];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_bge_reranker_matches_reranker() {
+        let e = make_entry(
+            "launch-reranker-ai2.sh (BGE-Reranker-v2-M3)",
+            "/mnt/nvmeof/launchers",
+            8892,
+        );
+        let models = vec!["BAAI/bge-reranker-v2-m3".to_string()];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_bge_m3_rejects_reranker_entry() {
+        let e = make_entry(
+            "launch-reranker-ai2.sh (BGE-Reranker-v2-M3)",
+            "/mnt/nvmeof/launchers",
+            8892,
+        );
+        let models = vec!["BAAI/bge-m3".to_string()];
+        assert!(!model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_deepseek_1017_matches_entry() {
+        let e = make_entry(
+            "DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark",
+            "/home/sean/repos/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark",
+            8888,
+        );
+        let models = vec![
+            "deepseek-v41-flash-exl3".to_string(),
+            "DeepSeek-V4.1-Flash-1017".to_string(),
+        ];
+        assert!(model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_deepseek_1017_rejects_glm() {
+        let e = make_entry(
+            "DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark",
+            "/home/sean/repos/DeepSeek-V4.1-Flash-1017-EXL3-TensorFold-2x-DGX-Spark",
+            8888,
+        );
+        let models = vec!["GLM-5.3-Flash-EXL3".to_string()];
+        assert!(!model_matches_entry(&e, &models));
+    }
 }
