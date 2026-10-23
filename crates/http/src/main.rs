@@ -142,6 +142,8 @@ fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
             "cpu_temp_c": n.cpu_temp_c,
             "gpu_temp_c": n.gpu_temp_c,
             "gpu_load_pct": n.gpu_load_pct,
+            "gpu_power_w": n.gpu_power_w,
+            "gpu_power_instant_w": n.gpu_power_instant_w,
         }),
     }
 }

@@ -247,14 +247,16 @@
   /* ---- thermal & load ---- */
   .thermal-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
   @media (max-width: 900px) { .thermal-grid { grid-template-columns: 1fr; } }
-  .readouts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 14px; margin: 10px 0 12px; }
+  /* Six readouts: three across on wide panels, two across once the panel is
+     narrow enough that a third column would crush the values. */
+  .readouts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin: 10px 0 12px; }
   .readouts .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
   .readouts .value { font-family: var(--mono); font-size: 20px; font-weight: 700; line-height: 1.3; color: var(--text); }
   .readouts .value.warn { color: var(--amber); }
   .readouts .value.crit { color: var(--red); }
   .readouts .unit { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-left: 2px; }
   .thermal-chart { display: block; width: 100%; height: 190px; background: #0a0d13; border: 1px solid var(--border); border-radius: 8px; }
-  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; font-size: 11.5px; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; font-size: 11.5px; color: var(--muted); }
   .legend .key { display: inline-flex; align-items: center; gap: 6px; }
   .legend .swatch { width: 14px; height: 3px; border-radius: 2px; }
   .seg { display: inline-flex; gap: 4px; }
@@ -347,7 +349,7 @@
       </div>
     </div>
     <div class="thermal-grid" id="thermal"></div>
-    <p class="muted small" style="margin:12px 0 0">CPU/SoC is the hottest ACPI thermal zone the node reports, not a per-core sensor. Fan and RAM temperatures are not exposed on GB10, so they are not charted. Temperatures read against the left °C axis, both loads against the right % axis. Readouts turn amber or red above the thresholds — GPU 80/90&nbsp;°C, CPU/SoC 90/95&nbsp;°C, CPU load 85% — with one exception: GPU load stays neutral, because a node sitting at 100% while it serves is normal. History is held in this browser tab only — 2&nbsp;s samples, 30&nbsp;min max, lost on reload.</p>
+    <p class="muted small" style="margin:12px 0 0">Left axis is GPU-module power draw in watts, 0–150&nbsp;W. Right axis carries temperature in °C and load in %, both 0–100. Power is the GPU module only: GB10 exposes no power limit and no CPU/SoC power sensor. Average draw is the solid line, instantaneous draw the thin dimmed dashed one. CPU/SoC is the hottest ACPI thermal zone the node reports, not a per-core sensor; fan and RAM temperatures are not exposed, so they are not charted. Readouts turn amber or red above the thresholds — GPU 80/90&nbsp;°C, CPU/SoC 90/95&nbsp;°C, CPU load 85%; GPU load and both power lines stay neutral, since a node sitting at 100% while it serves is normal. History is held in this browser tab only — 2&nbsp;s samples, 30&nbsp;min max, lost on reload.</p>
   </section>
 
   <section class="card">
@@ -695,15 +697,18 @@ function nodeCard(name, role, cur, stale) {
   // local disk
   const dk = cur.disk;
   if (dk) {
+    // Same headline markup as the unified-memory row above — big value + small
+    // unit, flush right — so the two rows read as a matched pair. The unit is
+    // dropped when there is no number, so a missing reading is just "—".
     card.append(el('div', { style: 'margin-top:12px' },
       el('div', { class: 'row', style: 'margin-bottom:2px' },
         el('span', { class: 'muted small' }, `Local Disk ${dk.mount || '/'}`),
         el('div', { class: 'spacer' }),
-        el('span', { class: `small pct ${useClass(dk.use_pct)}`.trim() }, `${dk.use_pct != null ? dk.use_pct.toFixed(1) : '—'}%`)),
+        el('span', { class: 'big' }, fmtGiB(dk.avail_bytes)),
+        dk.avail_bytes == null ? null : el('span', { class: 'muted small' }, 'GiB available')),
       bar(dk.use_pct),
       el('div', { class: 'stat-grid' },
-        el('div', { class: 'label' }, `Used: ${fmtGiB(dk.used_bytes)} / ${fmtGiB(dk.total_bytes)} GiB`),
-        el('div', { class: 'label' }, `Avail: ${fmtGiB(dk.avail_bytes)} GiB`))));
+        el('div', { class: 'label' }, `Used: ${fmtGiB(dk.used_bytes)} / ${fmtGiB(dk.total_bytes)} GiB`))));
   }
   return card;
 }
@@ -738,18 +743,43 @@ let thermalResizeTimer = null;
 
 // warn/crit are readout thresholds; crit === null means the series has no red
 // state. `color` is series identity, not status. `dash` is the canvas line
-// pattern, so the two load series differ by shape as well as colour.
+// pattern, so the two load series and the two power series differ by shape as
+// well as colour. `axis` picks the scale: the left one is watts (0-150), the
+// right one carries temperature and load together (0-100).
+const AXIS_MAX = { left: 150, right: 100 };
+
 const THERMAL_SERIES = [
-  { key: 'gpu_temp_c',   name: 'GPU temp',     unit: '°C', color: '#f0883e', warn: 80, crit: 90 },
-  { key: 'cpu_temp_c',   name: 'CPU/SoC temp', unit: '°C', color: '#b48ef5', warn: 90, crit: 95 },
-  { key: 'cpu_load_pct', name: 'CPU load',     unit: '%',  color: '#4f9cf9', warn: 85, crit: null },
+  { key: 'gpu_temp_c',          name: 'GPU temp',     unit: '°C',  axis: 'right', color: '#f0883e', warn: 80, crit: 90 },
+  { key: 'cpu_temp_c',          name: 'CPU/SoC temp', unit: '°C',  axis: 'right', color: '#b48ef5', warn: 90, crit: 95 },
+  { key: 'cpu_load_pct',        name: 'CPU load',     unit: '%',   axis: 'right', color: '#4f9cf9', warn: 85, crit: null },
   // GPU load is deliberately threshold-free: 100% is what a node looks like
   // while it is serving, so colouring it amber/red would flag normal operation.
-  // It shares the right-hand % axis with CPU load, hence the dashed line.
-  { key: 'gpu_load_pct', name: 'GPU load',     unit: '%',  color: '#2dd4bf', warn: null, crit: null, dash: [4, 3] },
+  { key: 'gpu_load_pct',        name: 'GPU load',     unit: '%',   axis: 'right', color: '#2dd4bf', warn: null, crit: null, dash: [4, 3] },
+  // Power is read-only telemetry with no safe/unsafe band, so both stay neutral.
+  { key: 'gpu_power_w',         name: 'GPU power',    unit: 'W',   axis: 'left',  color: '#f472b6', warn: null, crit: null },
+  // Instantaneous draw is noisy, so it is drawn thin, dimmed and dotted — a
+  // secondary trace behind the average rather than a peer of it.
+  { key: 'gpu_power_instant_w', name: 'GPU power inst', unit: 'W', axis: 'left',  color: '#a3e635', warn: null, crit: null, dash: [2, 3], width: 1.1, alpha: 0.6, dot: false },
 ];
 
 const THERMAL_MISSING = '—';
+
+// Panel readout order. THERMAL_SERIES stays the metadata source (and the input
+// to the chart's paint order), so this list is kept separate: reordering the
+// readouts must not move which line paints first. Cells, the canvas summary and
+// the legend all walk this list, so their order can never drift apart.
+const READOUT_ORDER = [
+  'gpu_power_instant_w', 'gpu_temp_c', 'gpu_load_pct',
+  'gpu_power_w', 'cpu_temp_c', 'cpu_load_pct',
+];
+
+const SERIES_BY_KEY = new Map(THERMAL_SERIES.map((s) => [s.key, s]));
+
+// Resolves READOUT_ORDER to series objects, skipping any key that no longer
+// exists in THERMAL_SERIES rather than rendering an undefined cell.
+function orderedSeries() {
+  return READOUT_ORDER.map((k) => SERIES_BY_KEY.get(k)).filter(Boolean);
+}
 
 function numOrNull(v) {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
@@ -788,7 +818,9 @@ function buildThermalPanels() {
 
   for (const spec of [{ name: 'ai', role: 'Head' }, { name: 'ai2', role: 'Worker' }]) {
     const readouts = {};
-    const cells = THERMAL_SERIES.map((s) => {
+    // Built in READOUT_ORDER, but each cell still takes its label, unit and
+    // thresholds from its own series object, so value/label pairing is by key.
+    const cells = orderedSeries().map((s) => {
       const value = el('span', { class: 'value', text: THERMAL_MISSING });
       readouts[s.key] = value;
       return el('div', { class: 'readout' },
@@ -805,17 +837,16 @@ function buildThermalPanels() {
       el('div', { class: 'row' }, el('h3', {}, `${spec.name} — ${spec.role}`)),
       el('div', { class: 'readouts' }, ...cells),
       canvas,
-      el('div', { class: 'legend' }, ...THERMAL_SERIES.map((s) =>
-        el('span', { class: 'key' },
-          // Dashed series get a dashed swatch, so the legend carries the same
-          // shape cue as the chart rather than colour alone.
-          el('span', {
-            class: 'swatch',
-            style: s.dash
-              ? `background:repeating-linear-gradient(90deg, ${s.color} 0 4px, transparent 4px 7px)`
-              : `background:${s.color}`,
-          }),
-          s.name)))));
+      el('div', { class: 'legend' }, ...orderedSeries().map((s) => {
+        // The swatch repeats the line's own dash pattern and dimming, so the
+        // legend carries the same shape cue as the chart rather than colour alone.
+        const swatchBg = s.dash
+          ? `repeating-linear-gradient(90deg, ${s.color} 0 ${s.dash[0]}px, transparent ${s.dash[0]}px ${s.dash[0] + s.dash[1]}px)`
+          : s.color;
+        return el('span', { class: 'key' },
+          el('span', { class: 'swatch', style: `background:${swatchBg}` + (s.alpha == null ? '' : `; opacity:${s.alpha}`) }),
+          s.name);
+      }))));
 
     thermalUI[spec.name] = { readouts, canvas };
   }
@@ -825,7 +856,7 @@ function updateThermalPanel(name, node) {
   const ui = thermalUI[name];
   if (!ui) return;
   const summary = [];
-  for (const s of THERMAL_SERIES) {
+  for (const s of orderedSeries()) {
     const v = node ? numOrNull(node[s.key]) : null;
     const value = ui.readouts[s.key];
     value.textContent = v == null ? THERMAL_MISSING : v.toFixed(1);
@@ -850,7 +881,9 @@ function drawThermalChart(canvas, points, windowSec) {
   ctx.fillStyle = '#0a0d13';
   ctx.fillRect(0, 0, cssW, cssH);
 
-  const padL = 32, padR = 36, padT = 22, padB = 18;
+  // Left gutter holds three-digit watt labels, right gutter three-digit
+  // temperature/load labels — both need more room than a bare 0-100 axis.
+  const padL = 38, padR = 44, padT = 22, padB = 18;
   const plotW = cssW - padL - padR;
   const plotH = cssH - padT - padB;
   if (plotW < 40 || plotH < 30) return;
@@ -861,7 +894,8 @@ function drawThermalChart(canvas, points, windowSec) {
   const now = Date.now();
   const t0 = now - spanMs;
 
-  // Both series families share a 0-100 scale: °C on the left, % on the right.
+  // Watt and temperature/load axes both want five intervals (150/30 and 100/20),
+  // so one set of six gridlines serves both scales.
   ctx.lineWidth = 1;
   ctx.strokeStyle = 'rgba(139,148,167,.13)';
   ctx.beginPath();
@@ -886,21 +920,24 @@ function drawThermalChart(canvas, points, windowSec) {
   ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
   ctx.fillStyle = '#8b94a7';
   ctx.textBaseline = 'middle';
+  // Left: watts, 150 at the top, 30 per step.
   ctx.textAlign = 'right';
   for (let i = 0; i <= 5; i++) {
-    ctx.fillText(String(100 - i * 20), padL - 6, padT + (plotH * i) / 5);
+    ctx.fillText(String(AXIS_MAX.left - i * 30), padL - 6, padT + (plotH * i) / 5);
   }
+  // Right: temperature and load share the 0-100 scale, 20 per step.
   ctx.textAlign = 'left';
   for (let i = 0; i <= 5; i++) {
-    ctx.fillText(`${100 - i * 20}%`, padL + plotW + 6, padT + (plotH * i) / 5);
+    ctx.fillText(String(AXIS_MAX.right - i * 20), padL + plotW + 6, padT + (plotH * i) / 5);
   }
 
+  // Axis captions live in the top margin, above the plot band.
   ctx.fillStyle = '#8b94a7';
   ctx.textBaseline = 'top';
   ctx.textAlign = 'left';
-  ctx.fillText('°C', 4, 3);
+  ctx.fillText('W', 4, 3);
   ctx.textAlign = 'right';
-  ctx.fillText('%', cssW - 4, 3);
+  ctx.fillText('°C / %', cssW - 4, 3);
 
   for (let i = 0; i <= tickCount; i++) {
     const secsAgo = Math.round(windowSec - i * stepMin);
@@ -913,7 +950,16 @@ function drawThermalChart(canvas, points, windowSec) {
   const visible = points.filter((p) => p.t >= t0);
   const hasReadings = visible.some((p) => THERMAL_SERIES.some((s) => p[s.key] != null));
 
-  for (const s of THERMAL_SERIES) {
+  // Clamp to the series' own axis, then map 0..max onto the plot band.
+  const yFor = (v, axis) => {
+    const max = AXIS_MAX[axis] || AXIS_MAX.right;
+    return padT + plotH - (Math.min(max, Math.max(0, v)) / max) * plotH;
+  };
+
+  // Dimmed secondary traces paint first so they can never mask a stronger line.
+  const drawOrder = [...THERMAL_SERIES].sort((a, b) => (a.alpha == null ? 1 : a.alpha) - (b.alpha == null ? 1 : b.alpha));
+
+  for (const s of drawOrder) {
     let pen = false;
     let last = null;
     ctx.beginPath();
@@ -922,25 +968,30 @@ function drawThermalChart(canvas, points, windowSec) {
       if (v == null) { pen = false; continue; }   // gap, not a drop to zero
       const frac = Math.min(1, Math.max(0, (p.t - t0) / spanMs));
       const x = padL + frac * plotW;
-      const y = padT + plotH - (Math.min(100, Math.max(0, v)) / 100) * plotH;
+      const y = yFor(v, s.axis);
       if (pen) ctx.lineTo(x, y);
       else { ctx.moveTo(x, y); pen = true; }
       last = { x, y, v };
     }
+    ctx.save();
+    ctx.globalAlpha = s.alpha == null ? 1 : s.alpha;
     ctx.strokeStyle = s.color;
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = s.width || 1.6;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-    ctx.setLineDash(s.dash || []);   // GPU load dashed, everything else solid
+    ctx.setLineDash(s.dash || []);
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.restore();
 
-    if (last) {
+    if (last && s.dot !== false) {
       const cls = thermalClass(last.v, s);
+      ctx.save();
+      ctx.globalAlpha = s.alpha == null ? 1 : s.alpha;
       ctx.beginPath();
       ctx.arc(last.x, last.y, 2.6, 0, Math.PI * 2);
       ctx.fillStyle = cls === 'crit' ? '#ef4444' : (cls === 'warn' ? '#f59e0b' : s.color);
       ctx.fill();
+      ctx.restore();
     }
   }
 

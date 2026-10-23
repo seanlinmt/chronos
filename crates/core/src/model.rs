@@ -97,6 +97,13 @@ pub struct NodeState {
     /// reports `[N/A]` or nvidia-smi is unavailable).
     #[serde(default)]
     pub gpu_load_pct: Option<f64>,
+    /// nvidia-smi average GPU power draw in watts (`None` on `[N/A]`; power
+    /// limits are not reported on GB10 and are deliberately not collected).
+    #[serde(default)]
+    pub gpu_power_w: Option<f64>,
+    /// nvidia-smi instantaneous GPU power draw in watts (`None` on `[N/A]`).
+    #[serde(default)]
+    pub gpu_power_instant_w: Option<f64>,
 }
 
 /// One entry in the published JSON state (shape fixed by spec).

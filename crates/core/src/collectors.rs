@@ -154,66 +154,121 @@ pub fn parse_temp_max(text: &str) -> Option<f64> {
     best
 }
 
+/// One merged nvidia-smi GPU sample (temperature, utilization, power).
+///
+/// Every field is independently optional: a driver that reports temperature
+/// but `[N/A]` for power still surfaces the temperature.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GpuStat {
+    /// GPU temperature (°C).
+    pub temp_c: Option<f64>,
+    /// Utilization percentage (0–100).
+    pub load_pct: Option<f64>,
+    /// Average power draw (W).
+    pub power_w: Option<f64>,
+    /// Instantaneous power draw (W).
+    pub power_instant_w: Option<f64>,
+}
+
+impl GpuStat {
+    fn is_empty(&self) -> bool {
+        self.temp_c.is_none()
+            && self.load_pct.is_none()
+            && self.power_w.is_none()
+            && self.power_instant_w.is_none()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.temp_c.is_some()
+            && self.load_pct.is_some()
+            && self.power_w.is_some()
+            && self.power_instant_w.is_some()
+    }
+}
+
+/// Parse one nvidia-smi csv component, tolerating a trailing unit.
+///
+/// `--format=csv,noheader,nounits` still appends units to some fields
+/// (`64.26 W`, occasionally `96 %`), so strip a trailing unit suffix before
+/// parsing. `[N/A]`, `[Not Supported]` and any other non-numeric token fall
+/// through to `None`.
+fn parse_gpu_field(field: &str) -> Option<f64> {
+    let stripped = field.trim().trim_end_matches(|c: char| {
+        c.is_ascii_alphabetic() || c == '%' || c.is_whitespace()
+    });
+    stripped.trim().parse::<f64>().ok()
+}
+
 /// Parse the csv line(s) of
-/// `nvidia-smi --query-gpu=temperature.gpu,utilization.gpu` into
-/// `(temperature °C, utilization %)`.
+/// `nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant`
+/// into a [`GpuStat`].
 ///
 /// `[N/A]` (or any unparsable / out-of-range value) yields `None` for that
-/// component only, so a driver that reports temperature but not utilization
-/// still surfaces the temperature (and vice versa). The first line carrying a
-/// usable value wins; per-GPU lines are collapsed to the first usable sample.
-pub fn parse_gpu_stat(text: &str) -> (Option<f64>, Option<f64>) {
-    let mut temp_c: Option<f64> = None;
-    let mut load_pct: Option<f64> = None;
+/// component only, never for the whole sample. The first line carrying a
+/// usable value wins per component, so per-GPU lines collapse to the first
+/// usable sample (single-GPU on GB10, so this is a no-op in practice).
+pub fn parse_gpu_stat(text: &str) -> GpuStat {
+    let mut stat = GpuStat::default();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let mut fields = line.split(',');
-        let t = fields
+        let temp = fields.next().and_then(parse_gpu_field).filter(|c| *c > 0.0 && *c <= 200.0);
+        let load = fields
             .next()
-            .map(str::trim)
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|c| *c > 0.0 && *c <= 200.0);
-        let u = fields
-            .next()
-            .map(str::trim)
-            .and_then(|v| v.parse::<f64>().ok())
+            .and_then(parse_gpu_field)
             .filter(|p| (0.0..=100.0).contains(p));
-        if temp_c.is_none() {
-            temp_c = t;
+        // GB10 idles ~60 W and peaks ~100 W; 1000 W is a generous ceiling that
+        // still rejects garbage.
+        let power = fields
+            .next()
+            .and_then(parse_gpu_field)
+            .filter(|w| (0.0..=1000.0).contains(w));
+        let power_instant = fields
+            .next()
+            .and_then(parse_gpu_field)
+            .filter(|w| (0.0..=1000.0).contains(w));
+        if stat.temp_c.is_none() {
+            stat.temp_c = temp;
         }
-        if load_pct.is_none() {
-            load_pct = u;
+        if stat.load_pct.is_none() {
+            stat.load_pct = load;
         }
-        if temp_c.is_some() && load_pct.is_some() {
+        if stat.power_w.is_none() {
+            stat.power_w = power;
+        }
+        if stat.power_instant_w.is_none() {
+            stat.power_instant_w = power_instant;
+        }
+        if stat.is_complete() {
             break;
         }
     }
-    (temp_c, load_pct)
+    stat
 }
 
-/// GPU temperature (°C) and utilization (%) from ONE nvidia-smi invocation.
+/// GPU temperature, utilization and power from ONE nvidia-smi invocation.
 ///
-/// Both queries are merged because nvidia-smi costs a few hundred ms and this
-/// runs per node per tick — never add a second call. `None` when the command
-/// fails or prints nothing usable; each inner value is `None` when the driver
-/// reports `[N/A]` for just that field.
-pub async fn read_gpu_stat() -> Option<(Option<f64>, Option<f64>)> {
+/// All four queries are merged because nvidia-smi costs a few hundred ms and
+/// this runs per node per tick — never add a second call. `None` when the
+/// command fails or prints nothing usable; each field of [`GpuStat`] is `None`
+/// when the driver reports `[N/A]` for just that field.
+pub async fn read_gpu_stat() -> Option<GpuStat> {
     let out = run_cmd(
         "nvidia-smi",
         &[
-            "--query-gpu=temperature.gpu,utilization.gpu",
+            "--query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant",
             "--format=csv,noheader,nounits",
         ],
     )
     .await?;
-    let (temp_c, load_pct) = parse_gpu_stat(&out);
-    if temp_c.is_none() && load_pct.is_none() {
+    let stat = parse_gpu_stat(&out);
+    if stat.is_empty() {
         None
     } else {
-        Some((temp_c, load_pct))
+        Some(stat)
     }
 }
 
@@ -365,7 +420,7 @@ cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200); echo \"PROC $p 
 echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/null | head -200; \
 echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
 echo '===CPUSTAT==='; head -1 /proc/stat; \
-echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits 2>/dev/null || true; \
+echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant --format=csv,noheader,nounits 2>/dev/null || true; \
 echo '===END==='";
 
 // =============================================================================
@@ -475,10 +530,10 @@ pub async fn node_from_blob(
     let mem = sec.get("MEMINFO").and_then(|s| parse_meminfo(s));
     let disk = sec.get("DFROOT").and_then(|s| parse_df(s));
     let cpu_temp = sec.get("CPUTEMP").and_then(|s| parse_temp_max(s));
-    let (gpu_temp, gpu_load) = sec
+    let gpu = sec
         .get("GPUSTAT")
         .map(|s| parse_gpu_stat(s))
-        .unwrap_or((None, None));
+        .unwrap_or_default();
     let load = sec
         .get("CPUSTAT")
         .and_then(|s| s.lines().find_map(|l| {
@@ -504,8 +559,10 @@ pub async fn node_from_blob(
         }),
         cpu_load_pct: load,
         cpu_temp_c: cpu_temp,
-        gpu_temp_c: gpu_temp,
-        gpu_load_pct: gpu_load,
+        gpu_temp_c: gpu.temp_c,
+        gpu_load_pct: gpu.load_pct,
+        gpu_power_w: gpu.power_w,
+        gpu_power_instant_w: gpu.power_instant_w,
     }
 }
 
@@ -531,15 +588,15 @@ pub async fn collect_nodes(
     .await
     .ok()
     .flatten();
-    // One nvidia-smi call for both temperature and utilization per tick.
-    let (gpu_temp, gpu_load) = tokio::time::timeout(
+    // One nvidia-smi call for temperature, utilization and both power draws.
+    let gpu = tokio::time::timeout(
         Duration::from_secs(CHECK_TIMEOUT_SECS),
         read_gpu_stat(),
     )
     .await
     .ok()
     .flatten()
-    .unwrap_or((None, None));
+    .unwrap_or_default();
     let cpu_sample = tokio::time::timeout(
         Duration::from_secs(CHECK_TIMEOUT_SECS),
         async { read_cpu_stat() },
@@ -568,8 +625,10 @@ pub async fn collect_nodes(
                 }),
                 cpu_load_pct: load,
                 cpu_temp_c: cpu_temp,
-                gpu_temp_c: gpu_temp,
-                gpu_load_pct: gpu_load,
+                gpu_temp_c: gpu.temp_c,
+                gpu_load_pct: gpu.load_pct,
+                gpu_power_w: gpu.power_w,
+                gpu_power_instant_w: gpu.power_instant_w,
             })
         }
         _ => None,
