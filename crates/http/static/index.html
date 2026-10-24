@@ -65,9 +65,6 @@
   .badge.STOPPING { background: rgba(245,158,11,.15); color: var(--amber); }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
 
-  .check { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
-  .check.ok  { background: var(--green); }
-  .check.bad { background: var(--red); }
 
   /* ---- bars ---- */
   .bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
@@ -326,12 +323,21 @@
     <path d="M8 10.5l4 4 4-4"/>
     <path d="M4.5 19h15"/>
   </symbol>
+  <symbol id="ic-docker" viewBox="0 0 24 24">
+    <rect x="3" y="9" width="3" height="2.5" rx="0.5"/>
+    <rect x="7" y="9" width="3" height="2.5" rx="0.5"/>
+    <rect x="11" y="9" width="3" height="2.5" rx="0.5"/>
+    <rect x="7" y="5.5" width="3" height="2.5" rx="0.5"/>
+    <rect x="11" y="5.5" width="3" height="2.5" rx="0.5"/>
+    <rect x="15" y="9" width="3" height="2.5" rx="0.5"/>
+    <path d="M2 13h15.5c1.5 0 2.8.6 3.7 1.8.3-.7.8-1.4 1.8-1.8-.4 1.7-.8 2.8-2 3.8-1.4 1.1-3.2 1.2-5.5 1.2H5.5C3.5 18 2 16.5 2 14.5v-1.5z"/>
+  </symbol>
 </svg>
 
 <div id="errbanner">connection lost, retrying…</div>
 
 <main>
-  <section class="card" id="topbar" aria-label="Storage and cluster status"></section>
+  <section class="card" id="topbar" aria-label="Cluster status"></section>
 
   <section class="card">
     <h2>Nodes</h2>
@@ -580,72 +586,31 @@ let logTarget = null;            // entry id currently open in the log panel
 
 /* ============================ top banner ============================ */
 
-function checkDot(name, ok) {
-  return el('span', { class: `check ${ok ? 'ok' : 'bad'}`, title: `${name}: ${ok ? 'ok' : 'FAIL'}` });
-}
-
 function bar(fillPct, ...extraClass) {
   const cls = ['bar', ...extraClass].join(' ');
   const fillCls = useClass(fillPct) || '';
   return el('div', { class: cls },
-    el('i', { style: `width:${Math.max(0, Math.min(100, fillPct || 0))}%` , class: fillCls }));
+    el('i', { style: `width:${Math.max(0, Math.min(100, fillPct || 0))}%`, class: fillCls }));
 }
 
-function renderTop(st) {
+function renderTop() {
   const root = $('#topbar');
   root.replaceChildren();
 
-  const online = !!(st && st.online);
-  let pill;
-  if (online) {
-    pill = el('span', { class: 'pill on' }, el('span', { class: 'dot' }), 'GFS2 /mnt/nvmeof: ONLINE');
-  } else {
-    const reason = (st && st.reason) ? ` — ${st.reason}` : '';
-    pill = el('span', { class: 'pill off', title: reason },
-      el('span', { class: 'dot' }), `GFS2 /mnt/nvmeof: OFFLINE${reason}`);
-  }
+  const title = el('div', { class: 'row', style: 'gap:8px' },
+    el('span', { style: 'font-weight:700; letter-spacing:0.5px; color:var(--text)' }, 'CHRONOS // GB10 CLUSTER CONTROL'));
 
-  const checks = st && st.checks ? st.checks : {};
-  const checkRow = el('span', { class: 'row', style: 'gap:5px' },
-    checkDot('ai_mount', checks.ai_mount),
-    checkDot('ai_raid', checks.ai_raid),
-    checkDot('ai_stat', checks.ai_stat),
-    checkDot('ai2_mount', checks.ai2_mount),
-    checkDot('ai2_stat', checks.ai2_stat));
-
-  const raidOk = !!checks.ai_raid;
-  const raid = el('span', { class: `pill ${raidOk ? 'on' : 'off'}`, title: 'RAID0 /dev/md0 health (ai_raid check)' },
-    el('span', { class: 'dot' }), `RAID0 /dev/md0: ${raidOk ? 'HEALTHY' : 'DEGRADED'}`);
-
-  const left = el('div', { class: 'row' }, pill, checkRow, raid);
-
-  // capacity bar
-  const d = st && st.disk;
-  let capEl;
-  if (d && d.total_bytes) {
-    const pct = d.use_pct != null ? d.use_pct : (d.used_bytes / d.total_bytes) * 100;
-    capEl = el('div', { class: 'row', style: 'flex:1; min-width:260px; gap:8px' },
-      el('span', { class: 'muted small' }, 'Shared storage'),
-      bar(pct),
-      el('span', { class: 'small mono' },
-        `${fmtGiB(d.used_bytes)} / ${fmtGiB(d.total_bytes)} GiB `,
-        el('span', { class: `pct ${useClass(pct)}`.trim() }, `(${(pct || 0).toFixed(1)}%)`)));
-  } else {
-    capEl = el('span', { class: 'muted small' }, 'Shared storage: no data');
-  }
+  const dockerBtn = iconBtn('docker', 'Start Docker on ai + ai2', {
+    cls: busy.has('docker:cluster') ? 'busy' : '',
+    onclick: startDockerCluster,
+  });
 
   const dropBtn = iconBtn('flush', 'Drop page cache on ai + ai2', {
     cls: busy.has('drop') ? 'busy' : '',
     onclick: dropCaches,
   });
-  if (!online) {
-    // Keep the action name in the accessible name; only the reason is appended.
-    dropBtn.disabled = true;
-    dropBtn.title = 'Storage offline — page cache cannot be dropped';
-    dropBtn.setAttribute('aria-label', 'Drop page cache on ai + ai2 (storage offline)');
-  }
 
-  root.append(el('div', { class: 'row' }, left, capEl, el('div', { class: 'spacer' }), dropBtn));
+  root.append(el('div', { class: 'row', style: 'gap:8px' }, title, el('div', { class: 'spacer' }), dockerBtn, dropBtn));
 }
 
 async function dropCaches() {
@@ -665,14 +630,61 @@ async function dropCaches() {
   }
 }
 
+async function startDockerCluster() {
+  busy.add('docker:cluster');
+  renderAll(lastData);
+  try {
+    await api('/api/cluster/start-docker', { method: 'POST' });
+    toast('Docker service started on ai + ai2');
+    await poll();
+  } catch (e) {
+    toast(`Failed to start Docker: ${e.message}`, 'err');
+  } finally {
+    busy.delete('docker:cluster');
+    renderAll(lastData);
+  }
+}
+
+async function startDocker(name) {
+  busy.add(`docker:${name}`);
+  renderAll(lastData);
+  try {
+    await api(`/api/nodes/${name}/start-docker`, { method: 'POST' });
+    toast(`Docker service started on ${name}`);
+    await poll();
+  } catch (e) {
+    toast(`Failed to start Docker on ${name}: ${e.message}`, 'err');
+  } finally {
+    busy.delete(`docker:${name}`);
+    renderAll(lastData);
+  }
+}
+
 /* ============================ node cards ============================ */
 
 function nodeCard(name, role, cur, stale) {
   const card = el('div', { class: `card${stale ? ' unreachable' : ''}`, style: 'background:#0d1118' });
-  card.append(el('div', { class: 'row', style: 'margin-bottom:10px' },
+
+  const dockerActive = cur && cur.docker_active === true;
+  const isBusy = busy.has(`docker:${name}`);
+  const dockerPill = stale
+    ? el('span', { class: 'pill off' }, 'unreachable')
+    : cur && cur.docker_active != null
+      ? el('span', { class: `pill ${dockerActive ? 'on' : 'off'}` }, `docker: ${dockerActive ? 'active' : 'inactive'}`)
+      : null;
+
+  const startDockerBtn = (!stale && cur)
+    ? iconBtn('docker', `Start Docker service on ${name}`, {
+        cls: isBusy ? 'busy' : '',
+        onclick: () => startDocker(name),
+      })
+    : null;
+
+  card.append(el('div', { class: 'row', style: 'margin-bottom:10px; gap:8px' },
     el('h3', {}, `${name} — ${role}`),
     el('div', { class: 'spacer' }),
-    stale ? el('span', { class: 'pill off' }, 'unreachable') : null));
+    dockerPill,
+    startDockerBtn));
 
   if (!cur) {
     card.append(el('div', { class: 'muted' }, 'no data'));
@@ -889,8 +901,7 @@ function drawThermalChart(canvas, points, windowSec) {
   if (plotW < 40 || plotH < 30) return;
 
   const spanMs = windowSec * 1000;
-  // Right edge is real wall-clock time, so a stalled feed leaves a growing gap
-  // at "now" instead of silently freezing the axis.
+  // Left edge is real wall-clock time (now), so values move from left to right over time.
   const now = Date.now();
   const t0 = now - spanMs;
 
@@ -940,8 +951,8 @@ function drawThermalChart(canvas, points, windowSec) {
   ctx.fillText('°C / %', cssW - 4, 3);
 
   for (let i = 0; i <= tickCount; i++) {
-    const secsAgo = Math.round(windowSec - i * stepMin);
-    const label = secsAgo <= 0 ? 'now' : `−${Math.round(secsAgo / 60)}m`;
+    const secsAgo = Math.round(i * stepMin);
+    const label = secsAgo <= 0 ? 'now' : `${Math.round(secsAgo / 60)}m`;
     const x = padL + (plotW * i) / tickCount;
     ctx.textAlign = i === 0 ? 'left' : (i === tickCount ? 'right' : 'center');
     ctx.fillText(label, x, padT + plotH + 5);
@@ -966,7 +977,7 @@ function drawThermalChart(canvas, points, windowSec) {
     for (const p of visible) {
       const v = p[s.key];
       if (v == null) { pen = false; continue; }   // gap, not a drop to zero
-      const frac = Math.min(1, Math.max(0, (p.t - t0) / spanMs));
+      const frac = Math.min(1, Math.max(0, (now - p.t) / spanMs));
       const x = padL + frac * plotW;
       const y = yFor(v, s.axis);
       if (pen) ctx.lineTo(x, y);
@@ -1131,10 +1142,9 @@ function actionBtn(id, key, iconName, label, cls, title, onClick, hidden) {
   return b;
 }
 
-function renderTable(entries, storage) {
+function renderTable(entries) {
   const body = $('#regbody');
   body.replaceChildren();
-  const offline = !(storage && storage.online);
   const sorted = [...entries].sort((a, b) => a.name.localeCompare(b.name));
 
   for (const e of sorted) {
@@ -1145,7 +1155,7 @@ function renderTable(entries, storage) {
     const stopHidden = !(e.status === 'RUNNING' || e.status === 'STARTING');
     const startDisabled = startHidden || e.status === 'STARTING' || busy.has(`${e.id}:start`);
 
-    const startBtn = actionBtn(e.id, 'start', 'play', 'Start', '', offline ? 'Storage offline' : '', startEntry, startHidden);
+    const startBtn = actionBtn(e.id, 'start', 'play', 'Start', '', '', startEntry, startHidden);
 
     const tr = el('tr', {},
       el('td', { class: 'mono' }, e.name),
@@ -1572,11 +1582,11 @@ function closeLogs() {
 
 function renderAll(data) {
   if (!data) return;
-  renderTop(data.storage);
+  renderTop();
   renderNodes(data.nodes);
   renderThermal(data.nodes);
   renderActive(data.entries || []);
-  renderTable(data.entries || [], data.storage);
+  renderTable(data.entries || []);
 }
 
 async function poll() {

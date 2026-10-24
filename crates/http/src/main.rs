@@ -97,29 +97,6 @@ async fn fs_read(path: &str) -> Option<String> {
 // embedded web UI reads (extracted from static/index.html).
 // ---------------------------------------------------------------------------
 
-fn storage_dto(s: &chronos_core::StorageState) -> Value {
-    let use_pct = match (s.used_bytes, s.total_bytes) {
-        (Some(u), Some(t)) if t > 0 => Some(u as f64 / t as f64 * 100.0),
-        _ => None,
-    };
-    json!({
-        "online": s.online,
-        "reason": s.reason,
-        "checks": {
-            "ai_mount": s.checks.ai_findmnt,
-            "ai_raid": s.checks.ai_mdstat,
-            "ai_stat": s.checks.ai_stat,
-            "ai2_mount": s.checks.ai2_findmnt,
-            "ai2_stat": s.checks.ai2_stat,
-        },
-        "disk": {
-            "total_bytes": s.total_bytes.unwrap_or(0),
-            "used_bytes": s.used_bytes.unwrap_or(0),
-            "avail_bytes": s.avail_bytes.unwrap_or(0),
-            "use_pct": use_pct.unwrap_or(0.0),
-        },
-    })
-}
 
 fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
     match n {
@@ -144,6 +121,7 @@ fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
             "gpu_load_pct": n.gpu_load_pct,
             "gpu_power_w": n.gpu_power_w,
             "gpu_power_instant_w": n.gpu_power_instant_w,
+            "docker_active": n.docker_active,
         }),
     }
 }
@@ -257,7 +235,6 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
         .collect();
     Json(json!({
         "ts": now,
-        "storage": storage_dto(&snap.storage),
         "nodes": {
             "ai": node_dto(snap.nodes.get("ai").unwrap_or(&None)),
             "ai2": node_dto(snap.nodes.get("ai2").unwrap_or(&None)),
@@ -563,17 +540,8 @@ async fn start_entry(
         .find(&id)
         .ok_or((StatusCode::NOT_FOUND, Json(json!({ "error": "unknown entry" }))))?;
 
-    // Gate on shared storage health.
-    let snap = state.collector.snapshot();
-    if !snap.storage.online {
-        let msg = format!(
-            "Shared storage offline: {}",
-            snap.storage.reason.clone().unwrap_or_else(|| "unknown".into())
-        );
-        return Err((StatusCode::CONFLICT, Json(json!({ "error": msg }))));
-    }
-
     // Enforce a single active primary-llm.
+    let snap = state.collector.snapshot();
     if entry.slot == "primary-llm" {
         let active = snap
             .entries
@@ -660,6 +628,30 @@ async fn entry_logs(
 async fn drop_caches() -> Json<Value> {
     let r = chronos_core::drop_caches().await;
     Json(json!({ "ok": r.ok, "ai": r.ai, "ai2": r.ai2 }))
+}
+
+async fn start_docker_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if name != "ai" && name != "ai2" {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown node" }))));
+    }
+    match state.collector.start_docker(&name).await {
+        Ok(msg) => Ok(Json(json!({ "ok": true, "message": msg }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))),
+    }
+}
+
+async fn start_docker_cluster(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let r_ai = state.collector.start_docker("ai").await;
+    let r_ai2 = state.collector.start_docker("ai2").await;
+    Json(json!({
+        "ai": r_ai.unwrap_or_else(|e| e),
+        "ai2": r_ai2.unwrap_or_else(|e| e),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +880,8 @@ async fn main() {
         .route("/api/entries/{id}/stop", post(stop_entry))
         .route("/api/entries/{id}/logs", get(entry_logs))
         .route("/api/cluster/drop-caches", post(drop_caches))
+        .route("/api/cluster/start-docker", post(start_docker_cluster))
+        .route("/api/nodes/{name}/start-docker", post(start_docker_handler))
         .route("/api/fs/list", get(fs_list))
         .with_state(state);
 

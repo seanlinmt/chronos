@@ -191,6 +191,42 @@ pub async fn drop_caches() -> DropCachesResult {
     DropCachesResult { ok, ai, ai2 }
 }
 
+/// Start the systemd docker service on a specific node (`ai` or `ai2`).
+pub async fn start_docker(node: &str) -> Result<String, String> {
+    match node {
+        "ai" => {
+            let out = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::process::Command::new("sh")
+                    .args(["-c", "sudo -n systemctl start docker"])
+                    .output(),
+            )
+            .await
+            .map_err(|_| "timed out starting docker on ai".to_string())?
+            .map_err(|e| format!("failed to run systemctl: {e}"))?;
+
+            if out.status.success() {
+                Ok("docker started on ai".to_string())
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr);
+                Err(format!("failed to start docker on ai: {}", err.trim()))
+            }
+        }
+        "ai2" => {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                ssh_ai2("sudo -n systemctl start docker"),
+            )
+            .await
+            .map_err(|_| "timed out starting docker on ai2".to_string())?
+            .map_err(|e| format!("failed to start docker on ai2: {e}"))?;
+
+            Ok("docker started on ai2".to_string())
+        }
+        other => Err(format!("unknown node `{other}`")),
+    }
+}
+
 /// Tail the entry's own log file (last `n` lines).
 pub async fn log_file_tail(id: &str, n: usize) -> Result<Vec<String>, String> {
     let log = log_file_for(id);
@@ -276,7 +312,6 @@ mod tests {
         Arc::new(Shared {
             tx,
             registry: RwLock::new(entries),
-            storage: RwLock::new(Default::default()),
             nodes: RwLock::new(Default::default()),
             mem: RwLock::new(Default::default()),
             probes: RwLock::new(Default::default()),

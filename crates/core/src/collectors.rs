@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::model::{
     AI2_LAN, CHECK_TIMEOUT_SECS, DiskInfo, HTTP_TIMEOUT_MS, NodeState, RegistryEntry,
-    SSH_BLOB_TIMEOUT_SECS, StorageChecks, StorageState,
+    SSH_BLOB_TIMEOUT_SECS,
 };
 
 // =============================================================================
@@ -405,13 +405,10 @@ pub async fn ssh_ai2(cmd: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// One combined SSH batch for ai2 (meminfo, df, storage checks, GPU apps,
+/// One combined SSH batch for ai2 (meminfo, df, GPU apps,
 /// docker ps, per-PID proc samples). Minimizes SSH calls per tick.
 pub const AI2_BLOB: &str = "echo '===MEMINFO==='; grep -E '^(MemTotal|MemAvailable|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo; \
 echo '===DFROOT==='; df -B1 /; \
-echo '===FINDMNT==='; findmnt -n -o FSTYPE,OPTIONS /mnt/nvmeof; \
-echo '===DFNVMEOF==='; df -B1 /mnt/nvmeof; \
-echo '===STAT==='; stat -t /mnt/nvmeof/repos /mnt/nvmeof/huggingface >/dev/null 2>&1 && echo OK || echo FAIL; \
 echo '===GPUAPPS==='; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null; \
 echo '===DOCKERPS==='; docker ps --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev/null; \
 echo '===PROCS==='; for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
@@ -421,106 +418,23 @@ echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/nu
 echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
 echo '===CPUSTAT==='; head -1 /proc/stat; \
 echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant --format=csv,noheader,nounits 2>/dev/null || true; \
+echo '===DOCKER==='; systemctl is-active docker 2>/dev/null || true; \
 echo '===END==='";
 
-// =============================================================================
-// STORAGE GATEKEEPER
-// =============================================================================
-
-/// Storage gatekeeper pass (ai local + ai2 via ssh), every check timeout-wrapped.
-pub async fn collect_storage() -> StorageState {
-    let mut checks = StorageChecks::default();
-    let mut reasons: Vec<String> = Vec::new();
-
-    // --- ai (local) ---
-    let fm = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        run_cmd("findmnt", &["-n", "-o", "FSTYPE,OPTIONS", "/mnt/nvmeof"]),
-    )
-    .await;
-    checks.ai_findmnt = matches!(fm, Ok(Some(s)) if s.contains("gfs2"));
-    if !checks.ai_findmnt {
-        reasons.push("ai: findmnt /mnt/nvmeof not gfs2 (or timed out)".into());
-    }
-
-    let md = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
-        tokio::fs::read_to_string("/proc/mdstat").await.map_err(|e| e.to_string())
-    })
-    .await;
-    checks.ai_mdstat = matches!(&md, Ok(Ok(s)) if s.contains("md0 : active raid0"));
-    if !checks.ai_mdstat {
-        reasons.push("ai: /proc/mdstat missing 'md0 : active raid0'".into());
-    }
-
-    let st = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
-        tokio::process::Command::new("stat")
-            .args(["/mnt/nvmeof/repos", "/mnt/nvmeof/huggingface"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .map_err(|e| e.to_string())
-    })
-    .await;
-    checks.ai_stat = matches!(st, Ok(Ok(true)));
-    if !checks.ai_stat {
-        reasons.push("ai: stat /mnt/nvmeof/{repos,huggingface} failed (GFS2 hang?)".into());
-    }
-
-    // df for the shared GFS2 fs (only meaningful when gate passes; use ai's view).
-    let df_nvmeof = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        run_cmd("df", &["-B1", "/mnt/nvmeof"]),
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|s| parse_df(&s));
-
-    // --- ai2 (via one combined ssh blob) ---
-    let blob = tokio::time::timeout(
-        Duration::from_secs(SSH_BLOB_TIMEOUT_SECS),
-        ssh_ai2(AI2_BLOB),
-    )
-    .await;
-    let sec = match blob {
-        Ok(Ok(s)) => sections(&s),
-        Ok(Err(e)) => {
-            reasons.push(format!("ai2: unreachable ({e})"));
-            HashMap::new()
-        }
-        Err(_) => {
-            reasons.push("ai2: ssh blob timed out".into());
-            HashMap::new()
-        }
-    };
-    checks.ai2_findmnt = sec.get("FINDMNT").map(|s| s.contains("gfs2")).unwrap_or(false);
-    if !checks.ai2_findmnt {
-        reasons.push("ai2: findmnt /mnt/nvmeof not gfs2".into());
-    }
-    checks.ai2_stat = sec.get("STAT").map(|s| s.contains("OK")).unwrap_or(false);
-    if !checks.ai2_stat {
-        reasons.push("ai2: stat /mnt/nvmeof/{repos,huggingface} failed".into());
-    }
-
-    let online = checks.ai_findmnt && checks.ai_mdstat && checks.ai_stat && checks.ai2_findmnt && checks.ai2_stat;
-    let df = df_nvmeof;
-
-    StorageState {
-        online,
-        fstype: if online { Some("gfs2".into()) } else { None },
-        reason: if online { None } else { Some(reasons.join("; ")) },
-        total_bytes: df.map(|d| d.0),
-        used_bytes: df.map(|d| d.1),
-        avail_bytes: df.map(|d| d.2),
-        checks,
-    }
-}
 
 // =============================================================================
 // NODE METRICS
 // =============================================================================
+
+pub async fn check_docker_active_local() -> Option<bool> {
+    let out = tokio::process::Command::new("systemctl")
+        .args(["is-active", "docker"])
+        .output()
+        .await
+        .ok()?;
+    let status_str = String::from_utf8_lossy(&out.stdout);
+    Some(status_str.trim() == "active")
+}
 
 pub async fn node_from_blob(
     blob: &str,
@@ -544,6 +458,14 @@ pub async fn node_from_blob(
             }
         }))
         .and_then(|sample| cpu_load_pct(cpu_prev, "ai2", sample));
+    let docker_active = sec.get("DOCKER").and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t == "active")
+        }
+    });
     NodeState {
         mem_total_bytes: mem.map(|m| m.0 * 1024),
         mem_available_bytes: mem.map(|m| m.1 * 1024),
@@ -563,6 +485,7 @@ pub async fn node_from_blob(
         gpu_load_pct: gpu.load_pct,
         gpu_power_w: gpu.power_w,
         gpu_power_instant_w: gpu.power_instant_w,
+        docker_active,
     }
 }
 
@@ -606,6 +529,13 @@ pub async fn collect_nodes(
     .flatten();
     // Guard dropped inside cpu_load_pct before any await below.
     let load = cpu_sample.and_then(|sample| cpu_load_pct(cpu_prev, "ai", sample));
+    let docker_active = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        async { check_docker_active_local().await },
+    )
+    .await
+    .ok()
+    .flatten();
     let ai_node = match (meminfo, df_root) {
         (Ok(Ok(m)), Ok(df)) => {
             let mem = parse_meminfo(&m);
@@ -629,6 +559,7 @@ pub async fn collect_nodes(
                 gpu_load_pct: gpu.load_pct,
                 gpu_power_w: gpu.power_w,
                 gpu_power_instant_w: gpu.power_instant_w,
+                docker_active,
             })
         }
         _ => None,

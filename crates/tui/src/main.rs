@@ -229,7 +229,7 @@ const KEYBAR: &str = "s start · x stop · l logs · a add · e edit · d del ·
 fn draw(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState) {
     let area = f.area();
     let chunks = Layout::vertical([
-        Constraint::Length(3), // top bar
+        Constraint::Length(2), // top bar
         Constraint::Length(9), // dual-node panel
         Constraint::Min(6),    // active endpoints
         Constraint::Length(9), // registry table
@@ -241,7 +241,7 @@ fn draw(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState) {
     draw_nodes(f, app, chunks[1]);
     draw_endpoints(f, app, chunks[2]);
     draw_table(f, app, ui, chunks[3]);
-    draw_footer(f, ui, app, chunks[4]);
+    draw_footer(f, ui, chunks[4]);
 
     if let Some((_, lines)) = &ui.log_view {
         draw_log_drawer(f, lines, bottom_half(chunks[2]));
@@ -255,41 +255,10 @@ fn draw(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState) {
 }
 
 fn draw_top_bar(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
-    let st = &app.storage;
-    let badge = if st.online {
-        let used = st.used_bytes.unwrap_or(0);
-        let total = st.total_bytes.unwrap_or(0);
-        let avail = st.avail_bytes.unwrap_or(0);
-        Span::styled(
-            format!(
-                " [ONLINE: {}G / {}T ({}G avail)]",
-                used / 1_073_741_824,
-                total / 1_099_511_627_776,
-                avail / 1_073_741_824
-            ),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            format!(" [OFFLINE: {}]", st.reason.as_deref().unwrap_or("checks failed")),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    };
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "SPARK-DECK // GB10 CLUSTER CONTROL",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            badge,
-        ]),
         Line::from(Span::styled(
-            if st.online {
-                "GFS2 gate passed on ai + ai2 — start/remove allowed"
-            } else {
-                "GFS2 gate FAILED — `s` (start) and `a` (add) are blocked"
-            },
-            Style::default().fg(if st.online { Color::Green } else { Color::Red }),
+            "SPARK-DECK // GB10 CLUSTER CONTROL",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             format!("last update: {}", app.timestamp),
@@ -386,6 +355,21 @@ fn draw_node_half(f: &mut Frame, name: &str, node: &Option<chronos_core::NodeSta
     );
     f.render_widget(Paragraph::new(label).style(Style::default()), rows[1]);
     f.render_widget(Paragraph::new(dlabel), rows[3]);
+    let docker_line = match node.as_ref().and_then(|n| n.docker_active) {
+        Some(true) => Line::from(vec![
+            Span::styled("● ", Style::default().fg(Color::Green)),
+            Span::raw("docker: active"),
+        ]),
+        Some(false) => Line::from(vec![
+            Span::styled("● ", Style::default().fg(Color::Red)),
+            Span::styled("docker: inactive", Style::default().fg(Color::Red)),
+        ]),
+        None => Line::from(vec![
+            Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("docker: unknown", Style::default().fg(Color::DarkGray)),
+        ]),
+    };
+    f.render_widget(Paragraph::new(docker_line), rows[4]);
 }
 
 fn draw_nodes(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
@@ -508,7 +492,7 @@ fn draw_table(f: &mut Frame, app: &chronos_core::AppState, ui: &UiState, area: r
     f.render_stateful_widget(table, area, &mut ts);
 }
 
-fn draw_footer(f: &mut Frame, ui: &UiState, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
+fn draw_footer(f: &mut Frame, ui: &UiState, area: ratatui::layout::Rect) {
     let mut spans = vec![Span::styled(KEYBAR, Style::default().fg(Color::DarkGray))];
     if let Some((m, at)) = &ui.message {
         if at.elapsed() < Duration::from_secs(8) {
@@ -519,9 +503,6 @@ fn draw_footer(f: &mut Frame, ui: &UiState, app: &chronos_core::AppState, area: 
                     .add_modifier(Modifier::BOLD),
             ));
         }
-    }
-    if !app.storage.online {
-        spans.push(Span::styled("  [GFS2 OFFLINE]", Style::default().fg(Color::Red)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -737,12 +718,7 @@ fn handle_key(
         }
         KeyCode::Char('s') => {
             if let Some(e) = app.entries.get(ui.selected) {
-                if !app.storage.online {
-                    ui.message = Some((
-                        "start blocked: GFS2 storage offline".into(),
-                        Instant::now(),
-                    ));
-                } else if e.slot == "primary-llm"
+                if e.slot == "primary-llm"
                     && app.entries.iter().any(|o| {
                         o.id != e.id && o.slot == "primary-llm" && o.state == "RUNNING"
                     })
@@ -767,11 +743,7 @@ fn handle_key(
             }
         }
         KeyCode::Char('a') => {
-            if !app.storage.online {
-                ui.message = Some(("add blocked: GFS2 storage offline".into(), Instant::now()));
-            } else {
-                ui.add_modal = Some(AddModal::new());
-            }
+            ui.add_modal = Some(AddModal::new());
         }
         KeyCode::Char('e') => {
             if let Some(e) = app.entries.get(ui.selected) {

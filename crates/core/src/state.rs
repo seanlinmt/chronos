@@ -9,11 +9,11 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::collectors::{
-    build_client, collect_mem_attr, collect_nodes, collect_storage,
+    build_client, collect_mem_attr, collect_nodes,
 };
 use crate::model::{
     AppState, EntrySnapshot, GraceKind, HTTP_INTERVAL_SECS, ProbeResult, RegistryEntry,
-    STARTING_GRACE_SECS, SYS_INTERVAL_SECS, StorageState,
+    STARTING_GRACE_SECS, SYS_INTERVAL_SECS,
 };
 use crate::probes::{CollectorState, probe_all};
 use crate::registry::load_or_seed_registry;
@@ -22,7 +22,6 @@ use crate::registry::load_or_seed_registry;
 pub struct Shared {
     pub tx: watch::Sender<Arc<AppState>>,
     pub registry: RwLock<Vec<RegistryEntry>>,
-    pub storage: RwLock<StorageState>,
     pub nodes: RwLock<BTreeMap<String, Option<crate::model::NodeState>>>,
     /// id -> (mem_ai_bytes, mem_ai2_bytes)
     pub mem: RwLock<HashMap<String, (u64, u64)>>,
@@ -36,19 +35,17 @@ pub struct Shared {
 impl Shared {
     pub fn publish(&self) {
         let registry = self.registry.read().unwrap().clone();
-        let storage = self.storage.read().unwrap().clone();
         let nodes = self.nodes.read().unwrap().clone();
         let mem = self.mem.read().unwrap().clone();
         let probes = self.probes.read().unwrap().clone();
         let states = self.states.read().unwrap().clone();
-        let app = assemble(&registry, &storage, &nodes, &mem, &probes, &states);
+        let app = assemble(&registry, &nodes, &mem, &probes, &states);
         let _ = self.tx.send(Arc::new(app));
     }
 }
 
 pub fn assemble(
     registry: &[RegistryEntry],
-    storage: &StorageState,
     nodes: &BTreeMap<String, Option<crate::model::NodeState>>,
     mem: &HashMap<String, (u64, u64)>,
     probes: &HashMap<String, ProbeResult>,
@@ -87,7 +84,6 @@ pub fn assemble(
     }
     AppState {
         timestamp: chrono::Utc::now().to_rfc3339(),
-        storage: storage.clone(),
         nodes: nodes.clone(),
         entries,
     }
@@ -156,11 +152,9 @@ async fn sys_loop(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(Duration::from_secs(SYS_INTERVAL_SECS));
     loop {
         interval.tick().await;
-        let storage = collect_storage().await;
         let nodes = collect_nodes(&shared.cpu_prev).await;
         let registry = shared.registry.read().unwrap().clone();
         let mem = collect_mem_attr(&registry).await;
-        *shared.storage.write().unwrap() = storage;
         *shared.nodes.write().unwrap() = nodes;
         *shared.mem.write().unwrap() = mem;
         shared.publish();
@@ -198,7 +192,6 @@ impl Collector {
         let shared = Arc::new(Shared {
             tx,
             registry: RwLock::new(registry),
-            storage: RwLock::new(StorageState::default()),
             nodes: RwLock::new(BTreeMap::new()),
             mem: RwLock::new(HashMap::new()),
             probes: RwLock::new(HashMap::new()),
@@ -271,6 +264,10 @@ impl Collector {
         crate::lifecycle::drop_caches().await
     }
 
+    pub async fn start_docker(&self, node: &str) -> Result<String, String> {
+        crate::lifecycle::start_docker(node).await
+    }
+
     /// TUI-style combined log view (file tail + docker logs per container).
     pub async fn entry_logs(&self, id: &str) -> Result<Vec<String>, String> {
         crate::lifecycle::entry_logs(id).await
@@ -287,10 +284,8 @@ pub async fn run_dump_state() -> Value {
     let registry = load_or_seed_registry();
     let mut cs = CollectorState::default();
 
-    let storage = collect_storage().await;
     // Seed a first /proc/stat sample so the one-pass dump can report ai's CPU
-    // load (collect_storage above supplies the delta window). ai2 has no
-    // previous sample in one-pass mode, so its load is None here.
+    // load. ai2 has no previous sample in one-pass mode, so its load is None here.
     let cpu_prev: std::sync::Mutex<BTreeMap<String, (u64, u64)>> =
         std::sync::Mutex::new(BTreeMap::new());
     if let Some(sample) = crate::collectors::read_cpu_stat() {
@@ -306,6 +301,6 @@ pub async fn run_dump_state() -> Value {
         states.insert(e.id.clone(), if ok { "RUNNING" } else { "STOPPED" }.to_string());
     }
 
-    let app = assemble(&registry, &storage, &nodes, &mem, &probes, &states);
+    let app = assemble(&registry, &nodes, &mem, &probes, &states);
     serde_json::to_value(&app).unwrap_or(Value::Null)
 }

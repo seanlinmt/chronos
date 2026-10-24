@@ -5,9 +5,7 @@
 //!
 //! - registry (entry model, seed of the 5 cluster entries, load/seed/save)
 //! - paths (`base_dir()` = `~/chronos`, `CHRONOS_HOME` env override)
-//! - storage gatekeeper (findmnt/mdstat/stat checks with 2s timeouts, both
-//!   nodes, single combined SSH blob for ai2)
-//! - node metrics (meminfo, `df -B1 /` and `/mnt/nvmeof`)
+//! - node metrics (meminfo, `df -B1 /`)
 //! - GB10 per-PID GPU attribution (nvidia-smi compute apps + VmRSS + cgroup
 //!   docker-scope matching + process_match)
 //! - engine probes (tensorfold /health, vllm /v1/models + /metrics with HTTP
@@ -34,11 +32,11 @@ pub use collectors::{
 };
 pub use lifecycle::{
     add_entry, container_log_lines, drop_caches, entry_logs, log_file_tail, remove_entry,
-    spawn_detached, start_entry, stop_entry, update_entry, DropCachesResult,
+    spawn_detached, start_docker, start_entry, stop_entry, update_entry, DropCachesResult,
 };
 pub use model::{
     AppState, DiskInfo, EntrySnapshot, GraceKind, NodeState, Prev, ProbeResult, RegistryEntry,
-    StorageChecks, StorageState, AI2_LAN, AI_LAN, CHECK_TIMEOUT_SECS, HTTP_INTERVAL_SECS,
+    AI2_LAN, AI_LAN, CHECK_TIMEOUT_SECS, HTTP_INTERVAL_SECS,
     HTTP_TIMEOUT_MS, SSH_BLOB_TIMEOUT_SECS, STARTING_GRACE_SECS, SYS_INTERVAL_SECS,
 };
 pub use paths::{base_dir, log_file_for, logs_dir, registry_path};

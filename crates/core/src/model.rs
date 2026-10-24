@@ -46,25 +46,6 @@ pub fn default_engine() -> String {
     "vllm".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct StorageChecks {
-    pub ai_findmnt: bool,
-    pub ai_mdstat: bool,
-    pub ai_stat: bool,
-    pub ai2_findmnt: bool,
-    pub ai2_stat: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct StorageState {
-    pub online: bool,
-    pub fstype: Option<String>,
-    pub reason: Option<String>,
-    pub total_bytes: Option<u64>,
-    pub used_bytes: Option<u64>,
-    pub avail_bytes: Option<u64>,
-    pub checks: StorageChecks,
-}
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct DiskInfo {
@@ -104,6 +85,9 @@ pub struct NodeState {
     /// nvidia-smi instantaneous GPU power draw in watts (`None` on `[N/A]`).
     #[serde(default)]
     pub gpu_power_instant_w: Option<f64>,
+    /// Whether docker.service is active (running) via systemctl.
+    #[serde(default)]
+    pub docker_active: Option<bool>,
 }
 
 /// One entry in the published JSON state (shape fixed by spec).
@@ -135,7 +119,6 @@ pub struct EntrySnapshot {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct AppState {
     pub timestamp: String,
-    pub storage: StorageState,
     pub nodes: BTreeMap<String, Option<NodeState>>,
     pub entries: Vec<EntrySnapshot>,
 }

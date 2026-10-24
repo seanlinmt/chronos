@@ -7,7 +7,7 @@
 - 2-node DGX Spark GB10 cluster: `ai` = head (passwordless SSH), `ai2` = worker (reached from `ai` via `ssh -o BatchMode=yes ai2`). GitHub: `seanlinmt/chronos` (renamed from spark-deck-http; remote URL updated).
 - Built and run **on `ai`**, never locally — the Mac has no guarantee of the Linux toolchain targets. Local Mac `cargo check` (1.99) is a typecheck filter only.
 - Cargo workspace, four crates:
-  - `crates/core` — ALL domain logic (registry, storage gatekeeper, GB10 per-PID GPU attribution, 3-engine probes, snapshot assembly, detached lifecycle). One source of truth; domain fixes land here once.
+  - `crates/core` — ALL domain logic (registry, GB10 per-PID GPU attribution, 3-engine probes, snapshot assembly, detached lifecycle). One source of truth; domain fixes land here once.
   - `crates/tui` — `chronos` bin (NOT `chronos-tui`; that name is retired): ratatui dashboard + `--dump-state` JSON mode. UI/keys only; domain via core.
   - `crates/http` — `chronos-http` bin: axum on `:8090` + `static/index.html` (embedded, `include_str!`). Runs as **system-scope** systemd unit on `ai`: `/etc/systemd/system/chronos-http.service` (`sudo systemctl restart chronos-http`). The adapter maps core snapshot → the exact `/api/state` key set the web UI reads. **Do not change the shape** without diffing against the JS in `static/index.html`.
   - `crates/embed` — two bins sharing `src/lib.rs`: `chronos-embed` (BGE-M3 embeddings, fastembed / ONNX int8, CPU-only, dense 1024-d) on `:8891`, and `chronos-rerank` (bge-reranker-v2-m3, fastembed / ONNX **fp32**, CPU-only, `/v1/rerank`) on `:8892`. Each runs as a **system-scope** systemd unit (`chronos-embed` on `ai`, `chronos-rerank` on `ai2`). The registry start paths `/mnt/nvmeof/launchers/launch-embedding-ai.sh` and `launch-reranker-ai2.sh` drive those units. They replace the retired `vllm_bge_m3` / `vllm_bge_reranker` containers. Note: fastembed returns raw logits for rerank, so `chronos-rerank` applies a sigmoid to match vLLM's 0–1 `relevance_score`.
@@ -52,7 +52,6 @@
 ```bash
 ssh ai 'cd ~/chronos && ./target/release/chronos --dump-state | jq .'
 ```
-- `storage.online == true`, all 5 checks true, avail ≈ 700+ GiB
 - `ai`/`ai2` `mem_total_bytes` ≈ 130 GB each, `mem_available_bytes` non-null
 - `glm53-tensorfold-spark` RUNNING, `mem_total_bytes` ≈ 205–220 GB, non-null telemetry (`concurrent_requests`, `total_tokens_generated`, `lifetime_decode_tok_per_sec`)
 - `DeepSeek-v4.1-Flash-2x-DGX-Spark` **STOPPED with `status_detail` ≈ "models http 401 Unauthorized" is the correct steady state** — it shares port 8888 with the running TensorFold. Do not "fix" this.
