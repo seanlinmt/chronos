@@ -88,6 +88,51 @@ pub struct NodeState {
     /// Whether docker.service is active (running) via systemctl.
     #[serde(default)]
     pub docker_active: Option<bool>,
+    // ------------------------------------------------------------------
+    // GPU clock-throttle telemetry (`nvidia-smi -q -d PERFORMANCE`).
+    //
+    // `clocks_event_reasons_counters.*` from `--query-gpu` is broken on this
+    // driver (580.178.04) — it returns "Not Active" instead of microseconds —
+    // so these come from the human-readable PERFORMANCE dump instead. Active
+    // flags are the literal "Active"/"Not Active" strings; counters are
+    // microseconds accumulated since the last driver reload.
+    // ------------------------------------------------------------------
+    /// SW power capping currently active.
+    #[serde(default)]
+    pub throttle_sw_power_cap: Option<bool>,
+    /// SW thermal slowdown currently active.
+    #[serde(default)]
+    pub throttle_sw_thermal: Option<bool>,
+    /// HW thermal slowdown currently active.
+    #[serde(default)]
+    pub throttle_hw_thermal: Option<bool>,
+    /// HW power brake slowdown currently active.
+    #[serde(default)]
+    pub throttle_hw_power_brake: Option<bool>,
+    /// Sync boost currently active.
+    #[serde(default)]
+    pub throttle_sync_boost: Option<bool>,
+    /// GPU idle clock reason currently active.
+    #[serde(default)]
+    pub throttle_idle: Option<bool>,
+    /// Applications-clocks-setting reason currently active.
+    #[serde(default)]
+    pub throttle_app_clocks: Option<bool>,
+    /// Accumulated SW power capping time (µs, since driver reload).
+    #[serde(default)]
+    pub throttle_sw_power_cap_us: Option<u64>,
+    /// Accumulated SW thermal slowdown time (µs).
+    #[serde(default)]
+    pub throttle_sw_thermal_us: Option<u64>,
+    /// Accumulated HW thermal slowdown time (µs).
+    #[serde(default)]
+    pub throttle_hw_thermal_us: Option<u64>,
+    /// Accumulated HW power brake time (µs).
+    #[serde(default)]
+    pub throttle_hw_power_brake_us: Option<u64>,
+    /// Accumulated sync boost time (µs).
+    #[serde(default)]
+    pub throttle_sync_boost_us: Option<u64>,
 }
 
 /// One entry in the published JSON state (shape fixed by spec).

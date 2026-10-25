@@ -168,21 +168,94 @@ pub struct GpuStat {
     pub power_w: Option<f64>,
     /// Instantaneous power draw (W).
     pub power_instant_w: Option<f64>,
+    // ------------------------------------------------------------------
+    // Clock-throttle telemetry. These come from a *separate*
+    // `nvidia-smi -q -d PERFORMANCE` invocation, never from the
+    // `--query-gpu` call: `clocks_event_reasons_counters.*` is broken on
+    // driver 580.178.04 (it returns "Not Active" instead of µs).
+    // ------------------------------------------------------------------
+    /// SW power capping currently active.
+    pub throttle_sw_power_cap: Option<bool>,
+    /// SW thermal slowdown currently active.
+    pub throttle_sw_thermal: Option<bool>,
+    /// HW thermal slowdown currently active.
+    pub throttle_hw_thermal: Option<bool>,
+    /// HW power brake slowdown currently active.
+    pub throttle_hw_power_brake: Option<bool>,
+    /// Sync boost currently active.
+    pub throttle_sync_boost: Option<bool>,
+    /// GPU idle clock reason currently active.
+    pub throttle_idle: Option<bool>,
+    /// Applications-clocks-setting reason currently active.
+    pub throttle_app_clocks: Option<bool>,
+    /// Accumulated SW power capping time (µs).
+    pub sw_power_cap_us: Option<u64>,
+    /// Accumulated SW thermal slowdown time (µs).
+    pub sw_thermal_us: Option<u64>,
+    /// Accumulated HW thermal slowdown time (µs).
+    pub hw_thermal_us: Option<u64>,
+    /// Accumulated HW power brake time (µs).
+    pub hw_power_brake_us: Option<u64>,
+    /// Accumulated sync boost time (µs).
+    pub sync_boost_us: Option<u64>,
 }
 
 impl GpuStat {
+    /// True when *nothing* usable was sampled, including throttle telemetry.
+    /// Must cover the throttle fields: `read_throttle_stat` produces a sample
+    /// with only those set, and `read_gpu_stat` gates on this too.
     fn is_empty(&self) -> bool {
         self.temp_c.is_none()
             && self.load_pct.is_none()
             && self.power_w.is_none()
             && self.power_instant_w.is_none()
+            && !self.has_throttle()
     }
 
+    /// Any throttle telemetry present.
+    fn has_throttle(&self) -> bool {
+        self.throttle_sw_power_cap.is_some()
+            || self.throttle_sw_thermal.is_some()
+            || self.throttle_hw_thermal.is_some()
+            || self.throttle_hw_power_brake.is_some()
+            || self.throttle_sync_boost.is_some()
+            || self.throttle_idle.is_some()
+            || self.throttle_app_clocks.is_some()
+            || self.sw_power_cap_us.is_some()
+            || self.sw_thermal_us.is_some()
+            || self.hw_thermal_us.is_some()
+            || self.hw_power_brake_us.is_some()
+            || self.sync_boost_us.is_some()
+    }
+
+    /// Completeness of the four `--query-gpu` components that
+    /// `parse_gpu_stat` fills. The throttle fields are deliberately excluded:
+    /// they come from a different command, so including them here would make
+    /// this never true inside `parse_gpu_stat` and dead-code the early break.
     fn is_complete(&self) -> bool {
         self.temp_c.is_some()
             && self.load_pct.is_some()
             && self.power_w.is_some()
             && self.power_instant_w.is_some()
+    }
+
+    /// Fold a separate `-q -d PERFORMANCE` sample into this one. Each field is
+    /// taken only when this sample has none for it, so a failed or absent
+    /// throttle read leaves the query-gpu fields intact.
+    fn with_throttle(mut self, other: GpuStat) -> GpuStat {
+        self.throttle_sw_power_cap = self.throttle_sw_power_cap.or(other.throttle_sw_power_cap);
+        self.throttle_sw_thermal = self.throttle_sw_thermal.or(other.throttle_sw_thermal);
+        self.throttle_hw_thermal = self.throttle_hw_thermal.or(other.throttle_hw_thermal);
+        self.throttle_hw_power_brake = self.throttle_hw_power_brake.or(other.throttle_hw_power_brake);
+        self.throttle_sync_boost = self.throttle_sync_boost.or(other.throttle_sync_boost);
+        self.throttle_idle = self.throttle_idle.or(other.throttle_idle);
+        self.throttle_app_clocks = self.throttle_app_clocks.or(other.throttle_app_clocks);
+        self.sw_power_cap_us = self.sw_power_cap_us.or(other.sw_power_cap_us);
+        self.sw_thermal_us = self.sw_thermal_us.or(other.sw_thermal_us);
+        self.hw_thermal_us = self.hw_thermal_us.or(other.hw_thermal_us);
+        self.hw_power_brake_us = self.hw_power_brake_us.or(other.hw_power_brake_us);
+        self.sync_boost_us = self.sync_boost_us.or(other.sync_boost_us);
+        self
     }
 }
 
@@ -269,6 +342,135 @@ pub async fn read_gpu_stat() -> Option<GpuStat> {
         None
     } else {
         Some(stat)
+    }
+}
+
+/// Split a `Label ... : value` line of the nvidia-smi PERFORMANCE dump.
+fn perf_kv(line: &str) -> Option<(&str, &str)> {
+    let (label, value) = line.split_once(':')?;
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+    Some((label, value.trim()))
+}
+
+/// Strip a trailing ` us`/`us` unit and parse the remainder as µs.
+/// `N/A`, empty and unparsable values yield `None`.
+fn parse_us(value: &str) -> Option<u64> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let v = v
+        .strip_suffix(" us")
+        .or_else(|| v.strip_suffix("us"))
+        .unwrap_or(v)
+        .trim();
+    v.parse::<u64>().ok()
+}
+
+/// Parse `nvidia-smi -q -d PERFORMANCE` into the throttle half of a [`GpuStat`].
+///
+/// Parsing is SECTION-AWARE because two regions share labels: values before the
+/// `Clocks Event Reasons Counters` header are active flags ("Active"/"Not
+/// Active"), values after it are accumulated µs counters. Label collisions that
+/// must not be confused: "SW Power Cap" (flag) vs "SW Power Capping" (counter),
+/// "Sync Boost" (both), "HW Thermal Slowdown" (both), "SW Thermal Slowdown"
+/// (both). "HW Slowdown" is only a parent flag — its two sub-reasons carry the
+/// real signals — and "Display Clock Setting" has no field in the contract, so
+/// both are ignored rather than invented.
+///
+/// Active flags: anything that is not the literal "Not Active" counts as
+/// active (empty values are skipped). Multi-GPU dumps repeat the sections; the
+/// first usable value per field wins.
+pub fn parse_throttle_stat(text: &str) -> GpuStat {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Sec {
+        None,
+        Active,
+        Counters,
+    }
+    let mut sec = Sec::None;
+    let mut stat = GpuStat::default();
+    for line in text.lines() {
+        let t = line.trim();
+        // Check the counters header first: it starts with the active header.
+        if t.eq_ignore_ascii_case("Clocks Event Reasons Counters") {
+            sec = Sec::Counters;
+            continue;
+        }
+        if t.eq_ignore_ascii_case("Clocks Event Reasons") {
+            sec = Sec::Active;
+            continue;
+        }
+        match sec {
+            Sec::None => {}
+            Sec::Active => {
+                let Some((label, value)) = perf_kv(line) else {
+                    continue;
+                };
+                let flag = match value {
+                    "" => None,
+                    "Not Active" => Some(false),
+                    _ => Some(true),
+                };
+                match label {
+                    "Idle" => stat.throttle_idle = stat.throttle_idle.or(flag),
+                    "Applications Clocks Setting" => {
+                        stat.throttle_app_clocks = stat.throttle_app_clocks.or(flag)
+                    }
+                    "SW Power Cap" => stat.throttle_sw_power_cap = stat.throttle_sw_power_cap.or(flag),
+                    "SW Thermal Slowdown" => {
+                        stat.throttle_sw_thermal = stat.throttle_sw_thermal.or(flag)
+                    }
+                    "HW Thermal Slowdown" => {
+                        stat.throttle_hw_thermal = stat.throttle_hw_thermal.or(flag)
+                    }
+                    "HW Power Brake Slowdown" => {
+                        stat.throttle_hw_power_brake = stat.throttle_hw_power_brake.or(flag)
+                    }
+                    "Sync Boost" => stat.throttle_sync_boost = stat.throttle_sync_boost.or(flag),
+                    _ => {}
+                }
+            }
+            Sec::Counters => {
+                let Some((label, value)) = perf_kv(line) else {
+                    continue;
+                };
+                let us = parse_us(value);
+                match label {
+                    "SW Power Capping" => stat.sw_power_cap_us = stat.sw_power_cap_us.or(us),
+                    "SW Thermal Slowdown" => stat.sw_thermal_us = stat.sw_thermal_us.or(us),
+                    "HW Thermal Slowdown" => stat.hw_thermal_us = stat.hw_thermal_us.or(us),
+                    "HW Power Braking" => stat.hw_power_brake_us = stat.hw_power_brake_us.or(us),
+                    "Sync Boost" => stat.sync_boost_us = stat.sync_boost_us.or(us),
+                    _ => {}
+                }
+            }
+        }
+    }
+    stat
+}
+
+/// GPU clock-throttle telemetry from `nvidia-smi -q -d PERFORMANCE`.
+///
+/// `clocks_event_reasons_counters.*` via `--query-gpu` is broken on driver
+/// 580.178.04 (returns "Not Active" instead of µs), so the human-readable dump
+/// is the only usable source. It costs ~0.04 s locally / ~0.4 s over SSH.
+/// `None` when nvidia-smi is unavailable or reports nothing usable.
+pub async fn read_throttle_stat() -> Option<GpuStat> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        run_cmd("nvidia-smi", &["-q", "-d", "PERFORMANCE"]),
+    )
+    .await
+    .ok()??;
+    let stat = parse_throttle_stat(&out);
+    if stat.has_throttle() {
+        Some(stat)
+    } else {
+        None
     }
 }
 
@@ -406,7 +608,13 @@ pub async fn ssh_ai2(cmd: &str) -> Result<String, String> {
 }
 
 /// One combined SSH batch for ai2 (meminfo, df, GPU apps,
-/// docker ps, per-PID proc samples). Minimizes SSH calls per tick.
+/// docker ps, per-PID proc samples, GPU clocks + throttle reasons). Minimizes
+/// SSH calls per tick: adding `-q -d PERFORMANCE` here costs ~0.4 s of the 6 s
+/// blob budget, so it must stay inside this single call.
+///
+/// `grep -v '^==='` strips nvidia-smi's `==============NVSMI LOG==============`
+/// banner, which `sections()` would otherwise mistake for a section marker and
+/// truncate the THROTTLE payload.
 pub const AI2_BLOB: &str = "echo '===MEMINFO==='; grep -E '^(MemTotal|MemAvailable|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo; \
 echo '===DFROOT==='; df -B1 /; \
 echo '===GPUAPPS==='; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null; \
@@ -418,6 +626,7 @@ echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/nu
 echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
 echo '===CPUSTAT==='; head -1 /proc/stat; \
 echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant --format=csv,noheader,nounits 2>/dev/null || true; \
+echo '===THROTTLE==='; nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -v '^===' || true; \
 echo '===DOCKER==='; systemctl is-active docker 2>/dev/null || true; \
 echo '===END==='";
 
@@ -447,7 +656,12 @@ pub async fn node_from_blob(
     let gpu = sec
         .get("GPUSTAT")
         .map(|s| parse_gpu_stat(s))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .with_throttle(
+            sec.get("THROTTLE")
+                .map(|s| parse_throttle_stat(s))
+                .unwrap_or_default(),
+        );
     let load = sec
         .get("CPUSTAT")
         .and_then(|s| s.lines().find_map(|l| {
@@ -486,6 +700,18 @@ pub async fn node_from_blob(
         gpu_power_w: gpu.power_w,
         gpu_power_instant_w: gpu.power_instant_w,
         docker_active,
+        throttle_sw_power_cap: gpu.throttle_sw_power_cap,
+        throttle_sw_thermal: gpu.throttle_sw_thermal,
+        throttle_hw_thermal: gpu.throttle_hw_thermal,
+        throttle_hw_power_brake: gpu.throttle_hw_power_brake,
+        throttle_sync_boost: gpu.throttle_sync_boost,
+        throttle_idle: gpu.throttle_idle,
+        throttle_app_clocks: gpu.throttle_app_clocks,
+        throttle_sw_power_cap_us: gpu.sw_power_cap_us,
+        throttle_sw_thermal_us: gpu.sw_thermal_us,
+        throttle_hw_thermal_us: gpu.hw_thermal_us,
+        throttle_hw_power_brake_us: gpu.hw_power_brake_us,
+        throttle_sync_boost_us: gpu.sync_boost_us,
     }
 }
 
@@ -520,6 +746,18 @@ pub async fn collect_nodes(
     .ok()
     .flatten()
     .unwrap_or_default();
+    // Throttle telemetry needs its own `-q -d PERFORMANCE` invocation (~0.04 s
+    // local); `clocks_event_reasons_counters.*` via --query-gpu is broken on
+    // this driver. Merged into the same GpuStat.
+    let throttle = tokio::time::timeout(
+        Duration::from_secs(CHECK_TIMEOUT_SECS),
+        read_throttle_stat(),
+    )
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    let gpu = gpu.with_throttle(throttle);
     let cpu_sample = tokio::time::timeout(
         Duration::from_secs(CHECK_TIMEOUT_SECS),
         async { read_cpu_stat() },
@@ -560,6 +798,18 @@ pub async fn collect_nodes(
                 gpu_power_w: gpu.power_w,
                 gpu_power_instant_w: gpu.power_instant_w,
                 docker_active,
+                throttle_sw_power_cap: gpu.throttle_sw_power_cap,
+                throttle_sw_thermal: gpu.throttle_sw_thermal,
+                throttle_hw_thermal: gpu.throttle_hw_thermal,
+                throttle_hw_power_brake: gpu.throttle_hw_power_brake,
+                throttle_sync_boost: gpu.throttle_sync_boost,
+                throttle_idle: gpu.throttle_idle,
+                throttle_app_clocks: gpu.throttle_app_clocks,
+                throttle_sw_power_cap_us: gpu.sw_power_cap_us,
+                throttle_sw_thermal_us: gpu.sw_thermal_us,
+                throttle_hw_thermal_us: gpu.hw_thermal_us,
+                throttle_hw_power_brake_us: gpu.hw_power_brake_us,
+                throttle_sync_boost_us: gpu.sync_boost_us,
             })
         }
         _ => None,

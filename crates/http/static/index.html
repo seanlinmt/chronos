@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Spark Deck — DGX Cluster</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='c-grad' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2338bdf8'/%3E%3Cstop offset='45%25' stop-color='%234f9cf9'/%3E%3Cstop offset='100%25' stop-color='%232563eb'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='7' fill='%230b0e14'/%3E%3Crect x='0.75' y='0.75' width='30.5' height='30.5' rx='6.25' fill='%2311151c' stroke='%231c2433' stroke-width='1.5'/%3E%3Cpath d='M 23.3 10.7 A 8.2 8.2 0 1 0 23.3 21.3' fill='none' stroke='url(%23c-grad)' stroke-width='4.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="alternate icon" href="/favicon.ico">
 <style>
   :root {
     --bg: #0b0e14;
@@ -144,6 +146,36 @@
   .ep-hero .unit { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 3px; }
   .ep-hero .sub { font-size: 11px; color: var(--muted); font-family: var(--mono); }
   .unreachable { opacity: .45; }
+
+  /* ---- GPU throttle telemetry ---- */
+  /* Appended to the node card below its existing rows, so the card keeps the
+     same shape whether or not throttle data is present. */
+  .throttle { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .thr-rows {
+    display: grid; grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 4px 14px; margin-top: 8px; align-items: baseline;
+  }
+  .thr-head {
+    color: var(--muted); font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: .5px; text-align: right;
+  }
+  .thr-name { color: var(--muted); font-size: 12px; line-height: 1.35; }
+  .thr-lifetime, .thr-delta {
+    font-family: var(--mono); font-size: 12px;
+    text-align: right; white-space: nowrap;
+  }
+  .thr-lifetime { color: var(--text); }
+  .thr-lifetime.zero { color: var(--muted); }
+  .thr-delta { color: var(--amber); }
+  .thr-delta.zero { color: var(--muted); }
+  .thr-chip {
+    display: inline-flex; align-items: center;
+    padding: 2px 8px; border-radius: 5px;
+    font-size: 11px; font-weight: 700; letter-spacing: .3px;
+  }
+  .thr-chip.hw { background: rgba(239,68,68,.15); color: var(--red); }
+  .thr-chip.sw { background: rgba(245,158,11,.15); color: var(--amber); }
+  .thr-note { margin-top: 6px; line-height: 1.4; }
 
   /* ---- error banner ---- */
   #errbanner {
@@ -322,6 +354,10 @@
     <path d="M12 4.5v9.5"/>
     <path d="M8 10.5l4 4 4-4"/>
     <path d="M4.5 19h15"/>
+  </symbol>
+  <symbol id="ic-clock" viewBox="0 0 24 24">
+    <circle cx="12" cy="12" r="8.5"/>
+    <path d="M12 7.5V12l3 2"/>
   </symbol>
   <symbol id="ic-docker" viewBox="0 0 24 24">
     <rect x="3" y="9" width="3" height="2.5" rx="0.5"/>
@@ -504,13 +540,14 @@ function icon(name, size = 16) {
 }
 
 /* Icon-only buttons carry their label in aria-label + title; they never rely on
-   a text node, so nothing can read .textContent to decide behaviour. */
+   a text node, so nothing can read .textContent to decide behaviour. opts.title
+   can carry a longer explanation than the short aria-label. */
 function iconBtn(name, label, opts = {}) {
   const b = el('button', {
     class: `btn icon${opts.cls ? ` ${opts.cls}` : ''}`,
     type: 'button',
     'aria-label': label,
-    title: label,
+    title: opts.title || label,
     onclick: opts.onclick || null,
   }, icon(name, opts.size || 16));
   if (opts.disabled) b.disabled = true;
@@ -610,7 +647,14 @@ function renderTop() {
     onclick: dropCaches,
   });
 
-  root.append(el('div', { class: 'row', style: 'gap:8px' }, title, el('div', { class: 'spacer' }), dockerBtn, dropBtn));
+  const resetBtn = iconBtn('clock', 'Reset throttle baseline', {
+    cls: busy.has('throttle:reset') ? 'busy' : '',
+    title: 'Reset throttle baseline. Sets a chronos-side marker for the "since baseline" deltas; GPU counters are lifetime totals and are not cleared.',
+    onclick: resetThrottleBaseline,
+    disabled: busy.has('throttle:reset'),
+  });
+
+  root.append(el('div', { class: 'row', style: 'gap:8px' }, title, el('div', { class: 'spacer' }), dockerBtn, dropBtn, resetBtn));
 }
 
 async function dropCaches() {
@@ -660,9 +704,135 @@ async function startDocker(name) {
   }
 }
 
+async function resetThrottleBaseline() {
+  if (busy.has('throttle:reset')) return;
+  busy.add('throttle:reset');
+  renderAll(lastData);
+  try {
+    const r = await api('/api/cluster/reset-throttle-baseline', { method: 'POST' });
+    const at = fmtBaselineTs(r && r.baseline_ts);
+    toast(at ? `Throttle baseline set to ${at}` : 'Throttle baseline set');
+    await poll();
+  } catch (e) {
+    toast(`Reset baseline failed: ${e.message}`, 'err');
+  } finally {
+    busy.delete('throttle:reset');
+    renderAll(lastData);
+  }
+}
+
+/* ============================ GPU throttle ============================ */
+
+/* /api/state carries nodes.<name>.throttle.{active, counters_us, since_reset_us}
+   plus a top-level throttle_baseline_ts. Every field is nullable and a null
+   counter means "not reported" — never zero. counters_us is lifetime
+   microseconds since driver load; the GPU cannot clear them without a driver
+   reload, so the reset control only moves the chronos-side baseline that
+   since_reset_us is measured from. */
+const THROTTLE_REASONS = [
+  { key: 'hw_thermal_slowdown',     label: 'hw thermal slowdown', level: 'hw' },
+  { key: 'hw_power_brake_slowdown', label: 'hw power brake',      level: 'hw' },
+  { key: 'sw_thermal_slowdown',     label: 'thermal slowdown',    level: 'sw' },
+  { key: 'sw_power_cap',            label: 'power cap',           level: 'sw' },
+  { key: 'sync_boost',              label: 'sync boost',          level: 'sw' },
+];
+
+const THROTTLE_MISSING = '—';
+
+/* Microseconds → "0 s" / "15 s" / "50 m 12 s" / "3 h 04 m". Null stays "—". */
+function fmtMicros(us) {
+  if (us == null || us === '') return THROTTLE_MISSING;
+  const n = Number(us);
+  if (!Number.isFinite(n) || n < 0) return THROTTLE_MISSING;
+  const total = Math.floor(n / 1e6);
+  if (total < 1) return '0 s';
+  const p2 = (v) => String(v).padStart(2, '0');
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h} h ${p2(m)} m`;
+  if (m > 0) return `${m} m ${p2(s)} s`;
+  return `${s} s`;
+}
+
+/* Raw value for the tooltip: the counter in microseconds, never the pretty form. */
+function throttleRawTitle(us, scope) {
+  if (us == null || us === '') return 'not reported';
+  const n = Number(us);
+  if (!Number.isFinite(n)) return 'not reported';
+  return `${n} µs ${scope}`;
+}
+
+/* RFC3339 → "2026-10-26 14:03 local" for display; invalid input falls back to
+   the raw string rather than "Invalid Date". Null stays null. */
+function fmtBaselineTs(ts) {
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return String(ts);
+  const p2 = (v) => String(v).padStart(2, '0');
+  return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())} local`;
+}
+
+/* Active-state row: one calm green "no throttle" when nothing is set, otherwise
+   every active reason as its own chip — red for hardware slowdowns, amber for
+   software ones. A node with no throttle object at all reads "throttle —". */
+function throttleChips(t) {
+  const active = t && t.active ? t.active : null;
+  if (!active) {
+    return el('span', { class: 'pill idle', title: 'no throttle telemetry from this node' }, 'throttle —');
+  }
+  const live = THROTTLE_REASONS.filter((r) => active[r.key] === true);
+  if (!live.length) return el('span', { class: 'pill on' }, 'no throttle');
+  return el('span', { class: 'row', style: 'gap:4px' },
+    live.map((r) => el('span', { class: `thr-chip ${r.level}`, title: `active: ${r.key}` }, r.label)));
+}
+
+function throttleBlock(name, cur, baselineTs) {
+  const t = cur && cur.throttle ? cur.throttle : null;
+  const counters = t && t.counters_us ? t.counters_us : null;
+  const since = t && t.since_reset_us ? t.since_reset_us : null;
+  const baseLabel = fmtBaselineTs(baselineTs);
+
+  const cells = [
+    el('span', {}),
+    el('span', { class: 'thr-head' }, 'lifetime'),
+    el('span', { class: 'thr-head' }, 'since baseline'),
+  ];
+
+  for (const r of THROTTLE_REASONS) {
+    const life = counters ? counters[r.key] : null;
+    const lifeText = fmtMicros(life);
+    const delta = since ? since[r.key] : null;
+    const deltaText = fmtMicros(delta);
+
+    cells.push(
+      el('span', { class: 'thr-name' }, r.label),
+      el('span', {
+        class: `thr-lifetime${lifeText === '0 s' ? ' zero' : ''}`,
+        title: throttleRawTitle(life, 'since driver load'),
+      }, lifeText),
+      el('span', {
+        class: `thr-delta${deltaText === '0 s' ? ' zero' : ''}`,
+        title: baseLabel ? throttleRawTitle(delta, 'since baseline') : 'no baseline set',
+      }, deltaText));
+  }
+
+  const note = baseLabel
+    ? `baseline ${baseLabel} — a chronos marker only; GPU counters are lifetime totals and reset does not clear them.`
+    : 'no baseline set — GPU counters are lifetime totals and reset does not clear them.';
+
+  return el('div', { class: 'throttle', role: 'group', 'aria-label': `${name} GPU throttle` },
+    el('div', { class: 'row', style: 'margin-bottom:2px' },
+      el('span', { class: 'muted small' }, 'GPU throttle'),
+      el('div', { class: 'spacer' }),
+      throttleChips(t)),
+    el('div', { class: 'thr-rows' }, ...cells),
+    el('div', { class: 'muted small thr-note' }, note));
+}
+
 /* ============================ node cards ============================ */
 
-function nodeCard(name, role, cur, stale) {
+function nodeCard(name, role, cur, stale, baselineTs) {
   const card = el('div', { class: `card${stale ? ' unreachable' : ''}`, style: 'background:#0d1118' });
 
   const dockerActive = cur && cur.docker_active === true;
@@ -722,10 +892,15 @@ function nodeCard(name, role, cur, stale) {
       el('div', { class: 'stat-grid' },
         el('div', { class: 'label' }, `Used: ${fmtGiB(dk.used_bytes)} / ${fmtGiB(dk.total_bytes)} GiB`))));
   }
+
+  // Throttle telemetry is appended after every existing row so the card's
+  // layout (headline gauges, stat grid) is untouched.
+  card.append(throttleBlock(name, cur, baselineTs));
+
   return card;
 }
 
-function renderNodes(nodes) {
+function renderNodes(nodes, baselineTs) {
   const wrap = $('#nodes');
   wrap.replaceChildren();
 
@@ -738,8 +913,8 @@ function renderNodes(nodes) {
   const aiStale = !ai || ai.mem_total_bytes == null;
   const ai2Stale = !ai2 || ai2.mem_total_bytes == null;
 
-  wrap.append(nodeCard('ai', 'Head', aiStale ? lastNodes.ai : ai, aiStale));
-  wrap.append(nodeCard('ai2', 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale));
+  wrap.append(nodeCard('ai', 'Head', aiStale ? lastNodes.ai : ai, aiStale, baselineTs));
+  wrap.append(nodeCard('ai2', 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale, baselineTs));
 }
 
 /* ============================ thermal & load ============================ */
@@ -1583,7 +1758,7 @@ function closeLogs() {
 function renderAll(data) {
   if (!data) return;
   renderTop();
-  renderNodes(data.nodes);
+  renderNodes(data.nodes, data.throttle_baseline_ts);
   renderThermal(data.nodes);
   renderActive(data.entries || []);
   renderTable(data.entries || []);

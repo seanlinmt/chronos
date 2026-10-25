@@ -30,6 +30,10 @@ pub struct Shared {
     pub grace: Mutex<HashMap<String, (GraceKind, Instant)>>,
     /// node -> previous /proc/stat (busy, total) sample for CPU load deltas.
     pub cpu_prev: std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+    /// GPU throttle-counter baseline (persisted to
+    /// `data/throttle-baseline.json`); `None` until one is captured. Read by
+    /// the HTTP adapter to report `since_reset_us` — never on the hot path.
+    pub throttle_baseline: RwLock<Option<crate::lifecycle::ThrottleBaseline>>,
 }
 
 impl Shared {
@@ -198,6 +202,7 @@ impl Collector {
             states: RwLock::new(states),
             grace: Mutex::new(HashMap::new()),
             cpu_prev: std::sync::Mutex::new(BTreeMap::new()),
+            throttle_baseline: RwLock::new(crate::lifecycle::load_throttle_baseline()),
         });
         // publish the initial snapshot so the first consumer frame has data
         shared.publish();
@@ -266,6 +271,26 @@ impl Collector {
 
     pub async fn start_docker(&self, node: &str) -> Result<String, String> {
         crate::lifecycle::start_docker(node).await
+    }
+
+    /// Capture a new GPU throttle-counter baseline for ai/ai2 (chronos-side —
+    /// the GPU counters themselves are never reset) and persist it.
+    pub async fn reset_throttle_baseline(
+        &self,
+    ) -> Result<crate::lifecycle::ThrottleBaseline, String> {
+        let r = crate::lifecycle::reset_throttle_baseline().await;
+        if let Ok(b) = &r {
+            // Guard dropped at the end of this statement; publish takes no awaits.
+            *self.shared.throttle_baseline.write().unwrap() = Some(b.clone());
+            self.shared.publish();
+        }
+        r
+    }
+
+    /// Current throttle baseline (`None` when never captured). Cheap clone of
+    /// the in-memory value; no file I/O on the request path.
+    pub fn throttle_baseline(&self) -> Option<crate::lifecycle::ThrottleBaseline> {
+        self.shared.throttle_baseline.read().unwrap().clone()
     }
 
     /// TUI-style combined log view (file tail + docker logs per container).

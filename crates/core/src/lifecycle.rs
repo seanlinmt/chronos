@@ -6,8 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::collectors::{is_ai2_host, ssh_ai2};
-use crate::model::{GraceKind, RegistryEntry};
+use serde::{Deserialize, Serialize};
+
+use crate::collectors::{
+    is_ai2_host, parse_throttle_stat, read_throttle_stat, ssh_ai2, GpuStat,
+};
+use crate::model::{GraceKind, RegistryEntry, SSH_BLOB_TIMEOUT_SECS};
 use crate::paths::log_file_for;
 use crate::registry::save_registry;
 use crate::state::Shared;
@@ -227,6 +231,146 @@ pub async fn start_docker(node: &str) -> Result<String, String> {
     }
 }
 
+// =============================================================================
+// GPU THROTTLE BASELINE
+// =============================================================================
+//
+// GPU clocks-event counters CANNOT be cleared from userspace on this driver
+// (`nvidia-smi -rgc` leaves them unchanged; a real clear needs a driver reload
+// or `-r`, both too invasive on a live inference host). So chronos keeps its
+// OWN baseline: a persisted snapshot of the five µs counters, with the UI
+// showing deltas since that snapshot. The GPU counters themselves are never
+// reset.
+
+/// The five GPU throttle counters that can be baselined (µs, accumulated since
+/// the driver last loaded).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CounterSnapshot {
+    #[serde(default)]
+    pub sw_power_cap_us: Option<u64>,
+    #[serde(default)]
+    pub sw_thermal_us: Option<u64>,
+    #[serde(default)]
+    pub hw_thermal_us: Option<u64>,
+    #[serde(default)]
+    pub hw_power_brake_us: Option<u64>,
+    #[serde(default)]
+    pub sync_boost_us: Option<u64>,
+}
+
+impl CounterSnapshot {
+    /// Extract the counter set from a parsed PERFORMANCE dump.
+    fn from_stat(s: &GpuStat) -> CounterSnapshot {
+        CounterSnapshot {
+            sw_power_cap_us: s.sw_power_cap_us,
+            sw_thermal_us: s.sw_thermal_us,
+            hw_thermal_us: s.hw_thermal_us,
+            hw_power_brake_us: s.hw_power_brake_us,
+            sync_boost_us: s.sync_boost_us,
+        }
+    }
+
+    /// True when no counter was available (nvidia-smi missing/failed).
+    pub fn is_empty(&self) -> bool {
+        self.sw_power_cap_us.is_none()
+            && self.sw_thermal_us.is_none()
+            && self.hw_thermal_us.is_none()
+            && self.hw_power_brake_us.is_none()
+            && self.sync_boost_us.is_none()
+    }
+
+    /// Counter deltas since `base`. A field stays `None` when either side is
+    /// unavailable (no baseline, or the current counter is missing); deltas
+    /// never go negative (counters only grow, but a driver reload could in
+    /// principle rewind them).
+    pub fn delta_since(&self, base: &CounterSnapshot) -> CounterSnapshot {
+        fn d(cur: Option<u64>, base: Option<u64>) -> Option<u64> {
+            match (cur, base) {
+                (Some(c), Some(b)) => Some(c.saturating_sub(b)),
+                _ => None,
+            }
+        }
+        CounterSnapshot {
+            sw_power_cap_us: d(self.sw_power_cap_us, base.sw_power_cap_us),
+            sw_thermal_us: d(self.sw_thermal_us, base.sw_thermal_us),
+            hw_thermal_us: d(self.hw_thermal_us, base.hw_thermal_us),
+            hw_power_brake_us: d(self.hw_power_brake_us, base.hw_power_brake_us),
+            sync_boost_us: d(self.sync_boost_us, base.sync_boost_us),
+        }
+    }
+}
+
+/// A chronos-side throttle baseline. `ts` is the RFC3339 capture time (stored
+/// as a string so no extra serde feature is needed for chrono).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThrottleBaseline {
+    pub ts: String,
+    pub ai: CounterSnapshot,
+    pub ai2: CounterSnapshot,
+}
+
+/// `<CHRONOS_HOME or ~/chronos>/data/throttle-baseline.json`.
+fn throttle_baseline_path() -> std::path::PathBuf {
+    crate::paths::base_dir()
+        .join("data")
+        .join("throttle-baseline.json")
+}
+
+/// Best-effort persist (missing dir is created; write errors are ignored so a
+/// read-only/full filesystem never fails the action).
+fn save_throttle_baseline(b: &ThrottleBaseline) {
+    let path = throttle_baseline_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(b) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// Load the persisted baseline (None when absent/unreadable). Used at startup
+/// so `since_reset_us` survives a service restart.
+pub fn load_throttle_baseline() -> Option<ThrottleBaseline> {
+    let text = std::fs::read_to_string(throttle_baseline_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Capture a NEW throttle baseline for both nodes and persist it.
+///
+/// Reads `ai` locally and `ai2` over the existing `ssh_ai2` helper. Fails only
+/// when counters are unavailable on BOTH nodes; a single-node capture still
+/// succeeds (the other node's counters are simply `None`).
+pub async fn reset_throttle_baseline() -> Result<ThrottleBaseline, String> {
+    let ai = read_throttle_stat()
+        .await
+        .map(|s| CounterSnapshot::from_stat(&s))
+        .unwrap_or_default();
+
+    // `grep -v '^==='` drops nvidia-smi's banner; harmless here but keeps the
+    // remote payload consistent with AI2_BLOB.
+    let ai2 = match tokio::time::timeout(
+        Duration::from_secs(SSH_BLOB_TIMEOUT_SECS),
+        ssh_ai2("nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -v '^===' || true"),
+    )
+    .await
+    {
+        Ok(Ok(out)) => CounterSnapshot::from_stat(&parse_throttle_stat(&out)),
+        _ => CounterSnapshot::default(),
+    };
+
+    if ai.is_empty() && ai2.is_empty() {
+        return Err("GPU throttle counters unavailable on both ai and ai2".to_string());
+    }
+
+    let baseline = ThrottleBaseline {
+        ts: chrono::Utc::now().to_rfc3339(),
+        ai,
+        ai2,
+    };
+    save_throttle_baseline(&baseline);
+    Ok(baseline)
+}
+
 /// Tail the entry's own log file (last `n` lines).
 pub async fn log_file_tail(id: &str, n: usize) -> Result<Vec<String>, String> {
     let log = log_file_for(id);
@@ -318,6 +462,7 @@ mod tests {
             states: RwLock::new(Default::default()),
             grace: std::sync::Mutex::new(Default::default()),
             cpu_prev: std::sync::Mutex::new(Default::default()),
+            throttle_baseline: std::sync::RwLock::new(None),
         })
     }
 

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -98,7 +98,10 @@ async fn fs_read(path: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 
-fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
+fn node_dto(
+    n: &Option<chronos_core::NodeState>,
+    baseline: Option<&chronos_core::CounterSnapshot>,
+) -> Value {
     match n {
         None => Value::Null,
         Some(n) => json!({
@@ -122,8 +125,56 @@ fn node_dto(n: &Option<chronos_core::NodeState>) -> Value {
             "gpu_power_w": n.gpu_power_w,
             "gpu_power_instant_w": n.gpu_power_instant_w,
             "docker_active": n.docker_active,
+            "throttle": throttle_dto(n, baseline),
         }),
     }
+}
+
+/// GPU clock-throttle block. `counters_us` are the driver's raw accumulated
+/// values; `since_reset_us` are chronos-side deltas against the persisted
+/// baseline (null when no baseline exists or the current counter is
+/// unavailable). GPU counters themselves are never reset — see
+/// `chronos_core::reset_throttle_baseline`.
+fn throttle_dto(
+    n: &chronos_core::NodeState,
+    baseline: Option<&chronos_core::CounterSnapshot>,
+) -> Value {
+    let counters = chronos_core::CounterSnapshot {
+        sw_power_cap_us: n.throttle_sw_power_cap_us,
+        sw_thermal_us: n.throttle_sw_thermal_us,
+        hw_thermal_us: n.throttle_hw_thermal_us,
+        hw_power_brake_us: n.throttle_hw_power_brake_us,
+        sync_boost_us: n.throttle_sync_boost_us,
+    };
+    let since = match baseline {
+        Some(b) => counters.delta_since(b),
+        None => chronos_core::CounterSnapshot::default(),
+    };
+    json!({
+        "active": {
+            "sw_power_cap": n.throttle_sw_power_cap,
+            "sw_thermal_slowdown": n.throttle_sw_thermal,
+            "hw_thermal_slowdown": n.throttle_hw_thermal,
+            "hw_power_brake_slowdown": n.throttle_hw_power_brake,
+            "sync_boost": n.throttle_sync_boost,
+            "idle": n.throttle_idle,
+            "applications_clocks_setting": n.throttle_app_clocks,
+        },
+        "counters_us": {
+            "sw_power_cap": counters.sw_power_cap_us,
+            "sw_thermal_slowdown": counters.sw_thermal_us,
+            "hw_thermal_slowdown": counters.hw_thermal_us,
+            "hw_power_brake_slowdown": counters.hw_power_brake_us,
+            "sync_boost": counters.sync_boost_us,
+        },
+        "since_reset_us": {
+            "sw_power_cap": since.sw_power_cap_us,
+            "sw_thermal_slowdown": since.sw_thermal_us,
+            "hw_thermal_slowdown": since.hw_thermal_us,
+            "hw_power_brake_slowdown": since.hw_power_brake_us,
+            "sync_boost": since.sync_boost_us,
+        },
+    })
 }
 
 fn telemetry_dto(e: &chronos_core::EntrySnapshot) -> Value {
@@ -221,9 +272,23 @@ async fn root() -> Html<&'static str> {
     Html(include_str!("../static/index.html"))
 }
 
+const FAVICON_SVG: &str = include_str!("../static/favicon.svg");
+
+async fn favicon() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
+    )
+}
+
 async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
     let snap = state.collector.snapshot();
     let reg = state.collector.registry();
+    // In-memory clone of the persisted baseline; no file I/O on this path.
+    let baseline = state.collector.throttle_baseline();
     let now = now_unix();
     let mut web = state.web.lock().unwrap();
     let entries: Vec<Value> = reg
@@ -233,11 +298,14 @@ async fn api_state(State(state): State<Arc<AppState>>) -> Json<Value> {
             entry_dto(e, s, &mut web, now)
         })
         .collect();
+    let ai_base = baseline.as_ref().map(|b| &b.ai);
+    let ai2_base = baseline.as_ref().map(|b| &b.ai2);
     Json(json!({
         "ts": now,
+        "throttle_baseline_ts": baseline.as_ref().map(|b| b.ts.clone()),
         "nodes": {
-            "ai": node_dto(snap.nodes.get("ai").unwrap_or(&None)),
-            "ai2": node_dto(snap.nodes.get("ai2").unwrap_or(&None)),
+            "ai": node_dto(snap.nodes.get("ai").unwrap_or(&None), ai_base),
+            "ai2": node_dto(snap.nodes.get("ai2").unwrap_or(&None), ai2_base),
         },
         "entries": entries,
     }))
@@ -654,6 +722,21 @@ async fn start_docker_cluster(
     }))
 }
 
+/// Capture a new chronos-side GPU throttle baseline for both nodes.
+///
+/// The GPU counters themselves cannot be cleared from userspace, so this
+/// snapshots them and the UI reports deltas (`since_reset_us`) from here on.
+/// 500 (not 400) on failure: the request is well-formed, the nodes are not
+/// answering with counters.
+async fn reset_throttle_baseline(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    match state.collector.reset_throttle_baseline().await {
+        Ok(b) => Ok(Json(json!({ "ok": true, "baseline_ts": b.ts }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /api/fs/list — filesystem browse for the "Add Repo" modal. Read-only.
 //
@@ -872,6 +955,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(root))
+        .route("/favicon.ico", get(favicon))
+        .route("/favicon.svg", get(favicon))
         .route("/api/state", get(api_state))
         .route("/api/entries", post(add_entry))
         .route("/api/entries/inspect", post(inspect_entry))
