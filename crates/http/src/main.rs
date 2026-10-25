@@ -965,6 +965,7 @@ async fn main() {
         .route("/api/entries/{id}/stop", post(stop_entry))
         .route("/api/entries/{id}/logs", get(entry_logs))
         .route("/api/cluster/drop-caches", post(drop_caches))
+        .route("/api/cluster/reset-throttle-baseline", post(reset_throttle_baseline))
         .route("/api/cluster/start-docker", post(start_docker_cluster))
         .route("/api/nodes/{name}/start-docker", post(start_docker_handler))
         .route("/api/fs/list", get(fs_list))

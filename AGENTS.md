@@ -79,6 +79,6 @@ ssh ai 'cd ~/chronos && ./target/release/chronos --dump-state | jq .'
 ssh ai 'curl -s http://127.0.0.1:8090/api/state | jq ".entries[] | {id, status, served_model, mem_total_bytes}"'
 curl -s -o /dev/null -w "%{http_code}" http://192.168.20.63:8090/   # 200, ~32KB page
 ```
-- Same statuses as Gate 1; entry objects carry all 18 keys incl. `telemetry.*` (see the adapter in `crates/http/src/main.rs`); `journalctl -u chronos-http` shows no errors.
+- Same statuses as Gate 1; entry objects carry all 19 keys incl. `telemetry.*` (`name` is a legacy alias of `id`; see `entry_dto` in `crates/http/src/main.rs`); top-level `throttle_baseline_ts` + `nodes.<n>.throttle` come from the throttle baseline; `journalctl -u chronos-http` shows no errors.
 
 Local Mac runs show null `/proc`-derived fields — expected; runtime metrics are only real on `ai`. Rebuilding does **not** update an already-running TUI session — the user must quit (`q`) and relaunch.
