@@ -900,9 +900,163 @@ async fn run_action_loop(
     }
 }
 
+// =============================================================================
+// 6. wait-idle GATE  (precondition for agent / cron jobs sharing the GPU)
+// =============================================================================
+
+const MAIN_USAGE: &str = "\
+chronos — 2-node DGX Spark (GB10) cluster control + telemetry
+
+usage:
+  chronos                                    interactive ratatui dashboard
+  chronos --dump-state                       one-pass JSON snapshot
+  chronos wait-idle [options]                block until the GPU box is idle
+  chronos help                               this text
+";
+
+const WAIT_IDLE_USAGE: &str = "\
+usage: chronos wait-idle [options]
+
+Blocks until the GPU entry has been idle — 0 concurrent, 0 queued and ~0 tok/s
+for every sample across the window — then exits 0. Progress goes to stderr.
+Built for gating: an agent or cron job should run its work only after exit 0.
+
+options:
+  --entry <id|auto>  registry entry to watch (default: auto = the RUNNING entry
+                     that actually reports telemetry, so model swaps are safe)
+  --for <dur>        idle window required before opening (default: 60s)
+  --sample <dur>     poll period (default: 2s)
+  --max-wait <dur>   total budget, must exceed --for (default: 300s)
+  --allow-unknown    count entries with no telemetry as idle (CPU/ONNX
+                     entries never report gauges; useless without this)
+  --json             print one JSON result object to stdout
+  -h, --help         this text
+
+exit codes: 0 open · 1 gate closed · 2 unknown entry / usage error
+durations accept 90, 90s, 5m, 1h
+";
+
+/// Parse `90`, `90s`, `5m`, `1h`.
+fn parse_dur(raw: &str) -> Result<Duration, String> {
+    let s = raw.trim();
+    let last = s.chars().last().ok_or_else(|| "empty duration".to_string())?;
+    let (digits, mult) = match last {
+        's' | 'S' => (&s[..s.len() - 1], 1u64),
+        'm' | 'M' => (&s[..s.len() - 1], 60),
+        'h' | 'H' => (&s[..s.len() - 1], 3600),
+        c if c.is_ascii_digit() => (s, 1),
+        c => return Err(format!("unsupported duration suffix '{c}' in '{s}'")),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("not a number: '{raw}'"))?;
+    Ok(Duration::from_secs(n.saturating_mul(mult)))
+}
+
+fn parse_wait_idle(args: &[String]) -> Result<(chronos_core::GateOptions, bool), String> {
+    let mut o = chronos_core::GateOptions::default();
+    let mut json = false;
+    let mut i = 0usize;
+
+    while i < args.len() {
+        let (key, inline) = match args[i].split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (args[i].clone(), None),
+        };
+        // `--flag value` or `--flag=value`
+        let next_value = |name: &str, i: &mut usize| -> Result<String, String> {
+            if let Some(v) = &inline {
+                return Ok(v.clone());
+            }
+            *i += 1;
+            args.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{name} requires a value"))
+        };
+
+        match key.as_str() {
+            "--entry" => o.entry = next_value("--entry", &mut i)?,
+            "--for" | "--window" => o.window = parse_dur(&next_value("--for", &mut i)?)?,
+            "--sample" => o.sample = parse_dur(&next_value("--sample", &mut i)?)?,
+            "--max-wait" => o.max_wait = parse_dur(&next_value("--max-wait", &mut i)?)?,
+            "--allow-unknown" => o.allow_unknown = true,
+            "--json" => json = true,
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+        i += 1;
+    }
+
+    o.validate()?;
+    Ok((o, json))
+}
+
+fn idle_outcome_json(o: &chronos_core::IdleOutcome) -> serde_json::Value {
+    use chronos_core::IdleOutcome as O;
+    match o {
+        O::Open {
+            entry,
+            idle_for,
+            waited,
+        } => serde_json::json!({
+            "gate": "open",
+            "entry": entry,
+            "idle_secs": idle_for.as_secs(),
+            "waited_secs": waited.as_secs(),
+            "exit_code": 0,
+        }),
+        O::TimedOut {
+            entry,
+            waited,
+            last,
+        } => serde_json::json!({
+            "gate": "closed",
+            "entry": entry,
+            "reason": "timeout",
+            "waited_secs": waited.as_secs(),
+            "last_sample": {
+                "concurrent_requests": last.concurrent,
+                "queued_requests": last.queued,
+                "live_tok_per_sec": last.tok_per_sec,
+            },
+            "exit_code": 1,
+        }),
+        O::UnknownEntry { entry, known } => serde_json::json!({
+            "gate": "error",
+            "entry": entry,
+            "reason": "unknown_entry",
+            "known_entries": known,
+            "exit_code": 2,
+        }),
+    }
+}
+
+async fn run_wait_idle(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{WAIT_IDLE_USAGE}");
+        return 0;
+    }
+    let (opts, json) = match parse_wait_idle(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("wait-idle: {e}\n\n{WAIT_IDLE_USAGE}");
+            return 2;
+        }
+    };
+
+    let outcome = chronos_core::wait_idle(&opts, |ev| eprintln!("[wait-idle] {ev}")).await;
+    if json {
+        println!("{}", idle_outcome_json(&outcome));
+    }
+    outcome.exit_code()
+}
+
 #[tokio::main]
 async fn main() {
-    if std::env::args().any(|a| a == "--dump-state") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // --dump-state is scanned anywhere in argv (pre-existing contract).
+    if args.iter().any(|a| a == "--dump-state") {
         let state = chronos_core::run_dump_state().await;
         println!(
             "{}",
@@ -910,5 +1064,15 @@ async fn main() {
         );
         return;
     }
+
+    match args.first().map(String::as_str) {
+        Some("wait-idle") => std::process::exit(run_wait_idle(&args[1..]).await),
+        Some("help") | Some("-h") | Some("--help") => {
+            print!("{MAIN_USAGE}");
+            return;
+        }
+        _ => {}
+    }
+
     run_tui().await;
 }

@@ -46,6 +46,23 @@
 - `ai2` metrics come from **one combined SSH blob per 3s tick** (6s overall timeout) — do not split into multiple SSH calls per tick.
 - Env overrides: `CHRONOS_HOME` (base dir, for Mac/test runs), `CHRONOS_HTTP_PORT` (bind port, default 8090).
 
+## Agent / cron gating (`chronos wait-idle`)
+
+Before running anything that competes with production inference, gate on idleness:
+
+```bash
+ssh ai 'cd ~/chronos && ./target/release/chronos wait-idle --for 60s --max-wait 300s'
+# exit 0 = GPU entry has been idle for the whole window → safe to proceed
+# exit 1 = gate closed (never held the window) → do not proceed
+# exit 2 = unknown entry / usage error
+```
+
+- Targets `--entry auto` by default: the `primary-llm` slot entry that reports telemetry (slot-first, so a model swap never retargets the gate at `bge-m3`; a stopped GPU server reads as closed, not idle).
+- Requires **`concurrent_requests == 0` AND `queued_requests == 0` AND `live_tok_per_sec ≈ 0`** for every sample across the window. `/api/state` gauges are 2 s point samples; the tok/s term is a delta over `generation_tokens_total`, so a flat window also means no tokens were generated between polls.
+- **Fail-closed**: a null gauge (probe failed, entry stopped/renamed, `/metrics` disabled, CPU-only entry) resets the window. `--allow-unknown` opts out — only for CPU/ONNX entries, never for the GPU server.
+- `--json` prints one machine-readable result object; progress lines go to stderr.
+- `scripts/idle-gate.sh` is the same policy over `/api/state` for hosts without the binary (needs curl+jq).
+
 ## Verification contract
 
 **Gate 1 — TUI (`--dump-state`):**
@@ -55,7 +72,7 @@ ssh ai 'cd ~/chronos && ./target/release/chronos --dump-state | jq .'
 - `ai`/`ai2` `mem_total_bytes` ≈ 130 GB each, `mem_available_bytes` non-null
 - `glm53-tensorfold-spark` RUNNING, `mem_total_bytes` ≈ 205–220 GB, non-null telemetry (`concurrent_requests`, `total_tokens_generated`, `lifetime_decode_tok_per_sec`)
 - `DeepSeek-v4.1-Flash-2x-DGX-Spark` **STOPPED with `status_detail` ≈ "models http 401 Unauthorized" is the correct steady state** — it shares port 8888 with the running TensorFold. Do not "fix" this.
-- bge-m3 (:8891) RUNNING via `chronos-embed` (CPU/ONNX int8), `mem_total_bytes` ≈ 0.9–1.1 GiB; bge-reranker-v2-m3 (:8892) RUNNING via `chronos-rerank` on `ai2` (CPU/ONNX fp32), ≈ 1.6–1.8 GiB; both with non-null `served_model`
+- bge-m3 (:8891) RUNNING via `chronos-embed` (CPU/ONNX int8), `mem_total_bytes` ≈ **0.3 GiB** (325 MB — current embedding weight set; earlier builds reported 0.9–1.1 GiB); bge-reranker-v2-m3 (:8892) RUNNING via `chronos-rerank` on `ai2` (CPU/ONNX fp32), ≈ **1.2 GiB** (1.26 GB, was documented as 1.6–1.8 GiB); both with non-null `served_model`. These are plain process RSS — CPU-only services never appear in the nvidia-smi compute-apps list, so no CUDA unified memory is added.
 
 **Gate 2 — HTTP:**
 ```bash

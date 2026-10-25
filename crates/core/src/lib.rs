@@ -16,6 +16,7 @@
 //!   start/stop/add/remove, drop-caches (both nodes), log tails
 
 pub mod collectors;
+pub mod idle;
 pub mod lifecycle;
 pub mod model;
 pub mod paths;
@@ -28,11 +29,17 @@ pub mod state;
 // ---------------------------------------------------------------------------
 
 pub use collectors::{
-    build_client, compact, gib, is_ai2_host, sanitize_id, sections,
+    build_client, compact, gib, is_ai2_host, parse_throttle_stat, read_throttle_stat, sanitize_id,
+    sections,
+};
+pub use idle::{
+    wait_idle, GateOptions, IdleEvent, IdleOutcome, IdleTracker, Sample, Tick, Verdict,
+    DEFAULT_MAX_WAIT_SECS, DEFAULT_SAMPLE_SECS, DEFAULT_WINDOW_SECS, resolve_target,
 };
 pub use lifecycle::{
-    add_entry, container_log_lines, drop_caches, entry_logs, log_file_tail, remove_entry,
-    spawn_detached, start_docker, start_entry, stop_entry, update_entry, DropCachesResult,
+    add_entry, container_log_lines, drop_caches, entry_logs, load_throttle_baseline, log_file_tail,
+    remove_entry, reset_throttle_baseline, spawn_detached, start_docker, start_entry, stop_entry,
+    update_entry, CounterSnapshot, DropCachesResult, ThrottleBaseline,
 };
 pub use model::{
     AppState, DiskInfo, EntrySnapshot, GraceKind, NodeState, Prev, ProbeResult, RegistryEntry,
