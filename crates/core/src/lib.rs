@@ -34,7 +34,8 @@ pub use collectors::{
 };
 pub use idle::{
     wait_idle, GateOptions, IdleEvent, IdleOutcome, IdleTracker, Sample, Tick, Verdict,
-    DEFAULT_MAX_WAIT_SECS, DEFAULT_SAMPLE_SECS, DEFAULT_WINDOW_SECS, resolve_target,
+    DEFAULT_HEARTBEAT_SECS, DEFAULT_MAX_WAIT_SECS, DEFAULT_SAMPLE_SECS, DEFAULT_WINDOW_SECS,
+    resolve_target,
 };
 pub use lifecycle::{
     add_entry, container_log_lines, drop_caches, entry_logs, load_throttle_baseline, log_file_tail,

@@ -31,6 +31,7 @@ chronos/
 chronos
 chronos --dump-state | jq .   # headless JSON snapshot, exit 0
 chronos wait-idle --for 60s   # block until the GPU entry is idle, then exit 0
+chronos wait-idle --for 30s --max-wait 0   # same, but wait indefinitely (hours)
 ```
 
 `wait-idle` is the precondition gate for agent/cron work that shares the GPU: exit `0` only after the `primary-llm` entry has held 0 concurrent / 0 queued / ~0 tok/s for the whole window (2 s samples, fail-closed on missing telemetry). Exit `1` = do not proceed, `2` = unknown entry. See [AGENTS.md](AGENTS.md) for details.

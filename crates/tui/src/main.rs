@@ -926,7 +926,9 @@ options:
                      that actually reports telemetry, so model swaps are safe)
   --for <dur>        idle window required before opening (default: 60s)
   --sample <dur>     poll period (default: 2s)
-  --max-wait <dur>   total budget, must exceed --for (default: 300s)
+  --max-wait <dur>   total budget, must exceed --for (default: 300s).
+                     0 / forever = no deadline: wait as long as the box is busy.
+  --heartbeat <dur>  period of the still-waiting line, 0 disables (default: 60s)
   --allow-unknown    count entries with no telemetry as idle (CPU/ONNX
                      entries never report gauges; useless without this)
   --json             print one JSON result object to stdout
@@ -936,9 +938,12 @@ exit codes: 0 open · 1 gate closed · 2 unknown entry / usage error
 durations accept 90, 90s, 5m, 1h
 ";
 
-/// Parse `90`, `90s`, `5m`, `1h`.
+/// Parse `90`, `90s`, `5m`, `1h`; also `0`/`forever`/`inf`/`none` -> zero.
 fn parse_dur(raw: &str) -> Result<Duration, String> {
     let s = raw.trim();
+    if matches!(s.to_ascii_lowercase().as_str(), "forever" | "inf" | "infinity" | "none") {
+        return Ok(Duration::ZERO);
+    }
     let last = s.chars().last().ok_or_else(|| "empty duration".to_string())?;
     let (digits, mult) = match last {
         's' | 'S' => (&s[..s.len() - 1], 1u64),
@@ -980,6 +985,7 @@ fn parse_wait_idle(args: &[String]) -> Result<(chronos_core::GateOptions, bool),
             "--for" | "--window" => o.window = parse_dur(&next_value("--for", &mut i)?)?,
             "--sample" => o.sample = parse_dur(&next_value("--sample", &mut i)?)?,
             "--max-wait" => o.max_wait = parse_dur(&next_value("--max-wait", &mut i)?)?,
+            "--heartbeat" => o.heartbeat = parse_dur(&next_value("--heartbeat", &mut i)?)?,
             "--allow-unknown" => o.allow_unknown = true,
             "--json" => json = true,
             other => return Err(format!("unknown argument '{other}'")),
@@ -1044,8 +1050,21 @@ async fn run_wait_idle(args: &[String]) -> i32 {
         }
     };
 
-    let outcome = chronos_core::wait_idle(&opts, |ev| eprintln!("[wait-idle] {ev}")).await;
-    if json {
+    let budget = if opts.max_wait.is_zero() {
+        "unlimited".to_string()
+    } else {
+        format!("{}s", opts.max_wait.as_secs())
+    };
+    eprintln!(
+        "[wait-idle] window={}s sample={}s budget={} heartbeat={}s entry={}",
+        opts.window.as_secs(),
+        opts.sample.as_secs(),
+        budget,
+        opts.heartbeat.as_secs(),
+        opts.entry,
+    );
+
+    let outcome = chronos_core::wait_idle(&opts, |ev| eprintln!("[wait-idle] {ev}")).await;    if json {
         println!("{}", idle_outcome_json(&outcome));
     }
     outcome.exit_code()

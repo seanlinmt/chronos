@@ -55,10 +55,15 @@ ssh ai 'cd ~/chronos && ./target/release/chronos wait-idle --for 60s --max-wait 
 # exit 0 = GPU entry has been idle for the whole window → safe to proceed
 # exit 1 = gate closed (never held the window) → do not proceed
 # exit 2 = unknown entry / usage error
+
+ssh ai 'cd ~/chronos && ./target/release/chronos wait-idle --for 30s --max-wait 0'
+# --max-wait 0 (or `forever`) = no deadline: wait however long the box stays busy,
+# for work queued behind a job that may run for hours. Ctrl-C to abort.
 ```
 
 - Targets `--entry auto` by default: the `primary-llm` slot entry that reports telemetry (slot-first, so a model swap never retargets the gate at an aux embedding entry; a stopped GPU server reads as closed, not idle).
-- Requires **`concurrent_requests == 0` AND `queued_requests == 0` AND `live_tok_per_sec ≈ 0`** for every sample across the window. `/api/state` gauges are 2 s point samples; the tok/s term is a delta over `generation_tokens_total`, so a flat window also means no tokens were generated between polls.
+- Requires **`concurrent_requests == 0` AND `queued_requests == 0` AND `live_tok_per_sec ≈ 0`** for every sample across the window. `/api/state` gauges are 2 s point samples; the tok/s term is a delta over `generation_tokens_total`, so a flat window also means no tokens were generated between polls. Caveat: only the TensorFold probe synthesises a zero rate for a flat counter — the plain vLLM probe reports `null` unless the counter moved, and `null` is tolerated when both gauges read zero, so for vLLM entries only the two gauges are load-bearing.
+- `--max-wait` defaults to **300 s**; on a busy box the gate exits 1 after that. Use `0`/`forever` for hour-scale queues, and a `--heartbeat` (default 60 s, `0` disables) keeps the wait visible — it fires at most once per `--sample` tick, so a heartbeat shorter than the sample period is a no-op.
 - **Fail-closed**: a null gauge (probe failed, entry stopped/renamed, `/metrics` disabled, CPU-only entry) resets the window. `--allow-unknown` opts out — only for CPU/ONNX entries, never for the GPU server.
 - `--json` prints one machine-readable result object; progress lines go to stderr.
 - `scripts/idle-gate.sh` is the same policy over `/api/state` for hosts without the binary (needs curl+jq).

@@ -34,6 +34,8 @@ pub const DEFAULT_WINDOW_SECS: u64 = 60;
 pub const DEFAULT_SAMPLE_SECS: u64 = 2;
 /// Default total budget before the gate gives up and reports `TimedOut`.
 pub const DEFAULT_MAX_WAIT_SECS: u64 = 300;
+/// Default heartbeat period while the box stays busy.
+pub const DEFAULT_HEARTBEAT_SECS: u64 = 60;
 /// Tokens/s at or below this reads as "not decoding".
 pub const TOK_EPSILON: f64 = 0.5;
 
@@ -87,6 +89,18 @@ impl fmt::Display for Sample {
             opt(self.queued),
             opt(self.tok_per_sec.map(|t| (t * 10.0).round() / 10.0)),
         )
+    }
+}
+
+/// `3725` -> `1h02m05s`, `90` -> `1m30s`.
+fn fmt_secs(s: u64) -> String {
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{sec:02}s")
+    } else if m > 0 {
+        format!("{m}m{sec:02}s")
+    } else {
+        format!("{sec}s")
     }
 }
 
@@ -187,7 +201,12 @@ pub struct GateOptions {
     pub entry: String,
     pub window: Duration,
     pub sample: Duration,
+    /// Total budget for the whole wait. `Duration::ZERO` = no deadline.
     pub max_wait: Duration,
+    /// Emit a `Waiting` event at most this often while the box stays busy;
+    /// `Duration::ZERO` disables the heartbeat. Matters for hour-long waits,
+    /// which would otherwise print nothing at all.
+    pub heartbeat: Duration,
     pub allow_unknown: bool,
 }
 
@@ -198,12 +217,24 @@ impl Default for GateOptions {
             window: Duration::from_secs(DEFAULT_WINDOW_SECS),
             sample: Duration::from_secs(DEFAULT_SAMPLE_SECS),
             max_wait: Duration::from_secs(DEFAULT_MAX_WAIT_SECS),
+            heartbeat: Duration::from_secs(DEFAULT_HEARTBEAT_SECS),
             allow_unknown: false,
         }
     }
 }
 
 impl GateOptions {
+    /// `--max-wait 0` means "no deadline": wait as long as the box is busy.
+    pub fn unlimited(&self) -> bool {
+        self.max_wait.is_zero()
+    }
+
+    /// Has the total budget run out for a wait that started `waited` ago?
+    /// An unlimited budget never expires.
+    pub fn expired(&self, waited: Duration) -> bool {
+        !self.unlimited() && waited >= self.max_wait
+    }
+
     /// Reject configurations that can never succeed or would spin.
     pub fn validate(&self) -> Result<(), String> {
         if self.sample.is_zero() {
@@ -212,9 +243,9 @@ impl GateOptions {
         if self.window.is_zero() {
             return Err("window must be > 0s".into());
         }
-        if self.max_wait <= self.window {
+        if !self.unlimited() && self.max_wait <= self.window {
             return Err(format!(
-                "max-wait ({}s) must be greater than the window ({}s)",
+                "max-wait ({}s) must be greater than the window ({}s), or 0 for no limit",
                 self.max_wait.as_secs(),
                 self.window.as_secs()
             ));
@@ -267,6 +298,12 @@ pub enum IdleEvent {
         verdict: Verdict,
         sample: Sample,
     },
+    /// Periodic "still waiting" line — keeps hour-long waits from going silent.
+    Waiting {
+        entry: String,
+        waited_secs: u64,
+        sample: Sample,
+    },
     Open {
         entry: String,
         idle_secs: u64,
@@ -297,13 +334,23 @@ impl fmt::Display for IdleEvent {
             IdleEvent::Open { entry, idle_secs } => {
                 write!(f, "OPEN: {entry} idle for {idle_secs}s — safe to proceed")
             }
+            IdleEvent::Waiting {
+                entry,
+                waited_secs,
+                sample,
+            } => write!(
+                f,
+                "still waiting: {entry} {sample} — elapsed {}",
+                fmt_secs(*waited_secs)
+            ),
             IdleEvent::Timeout {
                 entry,
                 waited_secs,
                 sample,
             } => write!(
                 f,
-                "TIMEOUT: {entry} never held idle for the full window in {waited_secs}s (last sample: {sample}) — do not proceed"
+                "TIMEOUT: {entry} never held idle for the full window in {} (last sample: {sample}) — do not proceed",
+                fmt_secs(*waited_secs)
             ),
         }
     }
@@ -376,6 +423,7 @@ where
 
     let mut tracker = IdleTracker::new(opts.window).allow_unknown(opts.allow_unknown);
     let start = Instant::now();
+    let mut last_beat = start;
 
     // The resolve pass above already sampled the target. Wait one poll period
     // before sampling again: back-to-back probes would compute the tok/s delta
@@ -417,7 +465,19 @@ where
         }
 
         let waited = now.saturating_duration_since(start);
-        if waited >= opts.max_wait {
+
+        // Heartbeat: an hours-long wait on a busy box otherwise prints nothing
+        // between "window reset" lines, which looks like a hang.
+        if !opts.heartbeat.is_zero() && now.saturating_duration_since(last_beat) >= opts.heartbeat {
+            last_beat = now;
+            on_event(&IdleEvent::Waiting {
+                entry: target.id.clone(),
+                waited_secs: waited.as_secs(),
+                sample: last,
+            });
+        }
+
+        if opts.expired(waited) {
             on_event(&IdleEvent::Timeout {
                 entry: target.id.clone(),
                 waited_secs: waited.as_secs(),
@@ -608,6 +668,30 @@ mod tests {
             Some("llm-a".into()),
             "a stopped GPU server must not fall back to an aux entry"
         );
+    }
+
+    #[test]
+    fn zero_max_wait_means_unlimited() {
+        let mut o = GateOptions {
+            max_wait: Duration::ZERO,
+            window: Duration::from_secs(30),
+            ..Default::default()
+        };
+        assert!(o.unlimited());
+        assert!(o.validate().is_ok(), "0 = wait forever, not an invalid budget");
+        assert!(!o.expired(Duration::from_secs(86_400)), "an unlimited gate never times out");
+
+        o.max_wait = Duration::from_secs(600);
+        assert!(!o.unlimited());
+        assert!(!o.expired(Duration::from_secs(599)));
+        assert!(o.expired(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn fmt_secs_is_human_readable() {
+        assert_eq!(fmt_secs(9), "9s");
+        assert_eq!(fmt_secs(90), "1m30s");
+        assert_eq!(fmt_secs(3725), "1h02m05s");
     }
 
     #[test]
