@@ -57,7 +57,7 @@ ssh ai 'cd ~/chronos && ./target/release/chronos wait-idle --for 60s --max-wait 
 # exit 2 = unknown entry / usage error
 ```
 
-- Targets `--entry auto` by default: the `primary-llm` slot entry that reports telemetry (slot-first, so a model swap never retargets the gate at `bge-m3`; a stopped GPU server reads as closed, not idle).
+- Targets `--entry auto` by default: the `primary-llm` slot entry that reports telemetry (slot-first, so a model swap never retargets the gate at an aux embedding entry; a stopped GPU server reads as closed, not idle).
 - Requires **`concurrent_requests == 0` AND `queued_requests == 0` AND `live_tok_per_sec ≈ 0`** for every sample across the window. `/api/state` gauges are 2 s point samples; the tok/s term is a delta over `generation_tokens_total`, so a flat window also means no tokens were generated between polls.
 - **Fail-closed**: a null gauge (probe failed, entry stopped/renamed, `/metrics` disabled, CPU-only entry) resets the window. `--allow-unknown` opts out — only for CPU/ONNX entries, never for the GPU server.
 - `--json` prints one machine-readable result object; progress lines go to stderr.
@@ -70,14 +70,16 @@ ssh ai 'cd ~/chronos && ./target/release/chronos wait-idle --for 60s --max-wait 
 ssh ai 'cd ~/chronos && ./target/release/chronos --dump-state | jq .'
 ```
 - `ai`/`ai2` `mem_total_bytes` ≈ 130 GB each, `mem_available_bytes` non-null
-- `glm53-tensorfold-spark` RUNNING, `mem_total_bytes` ≈ 205–220 GB, non-null telemetry (`concurrent_requests`, `total_tokens_generated`, `lifetime_decode_tok_per_sec`)
-- `DeepSeek-v4.1-Flash-2x-DGX-Spark` **STOPPED with `status_detail` ≈ "models http 401 Unauthorized" is the correct steady state** — it shares port 8888 with the running TensorFold. Do not "fix" this.
-- bge-m3 (:8891) RUNNING via `chronos-embed` (CPU/ONNX int8), `mem_total_bytes` ≈ **0.3 GiB** (325 MB — current embedding weight set; earlier builds reported 0.9–1.1 GiB); bge-reranker-v2-m3 (:8892) RUNNING via `chronos-rerank` on `ai2` (CPU/ONNX fp32), ≈ **1.2 GiB** (1.26 GB, was documented as 1.6–1.8 GiB); both with non-null `served_model`. These are plain process RSS — CPU-only services never appear in the nvidia-smi compute-apps list, so no CUDA unified memory is added.
+- The **active `primary-llm` entry** (the one that owns `:8888`) is RUNNING, with `mem_total_bytes` non-null in the ~200 GB range (GPU unified memory included) and non-null telemetry (`concurrent_requests`, `total_tokens_generated`, `lifetime_decode_tok_per_sec`).
+- Every other entry on `:8888` is **STOPPED**, with a `status_detail` that explains why (HTTP status / model mismatch). Only one server can hold the port, so this is the correct steady state — do not "fix" it, and never stop a running inference server to make a gate pass.
+- The aux services are RUNNING: `:8891` on `ai` (`chronos-embed`, CPU/ONNX int8) with `mem_total_bytes` ≈ **0.3 GiB**, and `:8892` on `ai2` (`chronos-rerank`, CPU/ONNX fp32) with ≈ **1.2 GiB**; both report a non-null `served_model`. These are plain process RSS — CPU-only services never appear in the nvidia-smi compute-apps list, so no CUDA unified memory is added. Their footprint follows the loaded weight set, so re-measure rather than assuming the previous numbers.
+
+Entry ids rotate with model swaps, so check by slot and port — never by name.
 
 **Gate 2 — HTTP:**
 ```bash
 ssh ai 'curl -s http://127.0.0.1:8090/api/state | jq ".entries[] | {id, status, served_model, mem_total_bytes}"'
-curl -s -o /dev/null -w "%{http_code}" http://192.168.20.63:8090/   # 200, ~32KB page
+curl -s -o /dev/null -w "%{http_code}" http://192.168.20.63:8090/   # 200, ~70 KB page
 ```
 - Same statuses as Gate 1; entry objects carry all 19 keys incl. `telemetry.*` (`name` is a legacy alias of `id`; see `entry_dto` in `crates/http/src/main.rs`); top-level `throttle_baseline_ts` + `nodes.<n>.throttle` come from the throttle baseline; `journalctl -u chronos-http` shows no errors.
 
