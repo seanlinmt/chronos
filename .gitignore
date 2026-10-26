@@ -21,3 +21,4 @@ plans/api-state-before.json
 .vscode/
 .idea/
 .archify/
+.playwright-mcp/
