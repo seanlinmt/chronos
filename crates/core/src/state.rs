@@ -9,7 +9,8 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::collectors::{
-    build_client, collect_mem_attr, collect_nodes,
+    ai2_mem_attr, build_client, collect_ai_mem_attr, collect_ai_node, collect_mem_attr,
+    collect_nodes, fetch_ai2_blob, merge_mem_attr, node_from_blob,
 };
 use crate::model::{
     AppState, EntrySnapshot, GraceKind, HTTP_INTERVAL_SECS, ProbeResult, RegistryEntry,
@@ -154,11 +155,37 @@ async fn http_loop(shared: Arc<Shared>, client: reqwest::Client) {
 
 async fn sys_loop(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(Duration::from_secs(SYS_INTERVAL_SECS));
+    // A tick that overruns (slow ssh / nvidia-smi) must not queue a burst of
+    // back-to-back passes: skip missed ticks instead of bursting to catch up.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        let nodes = collect_nodes(&shared.cpu_prev).await;
         let registry = shared.registry.read().unwrap().clone();
-        let mem = collect_mem_attr(&registry).await;
+
+        // ONE ai2 SSH blob per tick (AGENTS constraint), fetched concurrently
+        // with the independent ai-local reads. Both consumers — node metrics
+        // and per-PID attribution — parse this same blob below.
+        let (blob, ai_node, ai_mem) = tokio::join!(
+            fetch_ai2_blob(),
+            collect_ai_node(&shared.cpu_prev),
+            collect_ai_mem_attr(&registry),
+        );
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert("ai".to_string(), ai_node);
+        nodes.insert(
+            "ai2".to_string(),
+            match blob.as_deref() {
+                Some(b) => Some(node_from_blob(b, &shared.cpu_prev).await),
+                None => None,
+            },
+        );
+        let ai2_mem = blob
+            .as_deref()
+            .map(|b| ai2_mem_attr(b, &registry))
+            .unwrap_or_default();
+        let mem = merge_mem_attr(&registry, &ai_mem, &ai2_mem);
+
         *shared.nodes.write().unwrap() = nodes;
         *shared.mem.write().unwrap() = mem;
         shared.publish();
@@ -277,11 +304,11 @@ impl Collector {
     /// the GPU counters themselves are never reset) and persist it.
     pub async fn reset_throttle_baseline(
         &self,
-    ) -> Result<crate::lifecycle::ThrottleBaseline, String> {
+    ) -> Result<crate::lifecycle::ThrottleResetResult, String> {
         let r = crate::lifecycle::reset_throttle_baseline().await;
-        if let Ok(b) = &r {
+        if let Ok(res) = &r {
             // Guard dropped at the end of this statement; publish takes no awaits.
-            *self.shared.throttle_baseline.write().unwrap() = Some(b.clone());
+            *self.shared.throttle_baseline.write().unwrap() = Some(res.baseline.clone());
             self.shared.publish();
         }
         r

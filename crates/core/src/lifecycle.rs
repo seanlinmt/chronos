@@ -280,13 +280,14 @@ impl CounterSnapshot {
     }
 
     /// Counter deltas since `base`. A field stays `None` when either side is
-    /// unavailable (no baseline, or the current counter is missing); deltas
-    /// never go negative (counters only grow, but a driver reload could in
-    /// principle rewind them).
+    /// unavailable (no baseline, or the current counter is missing). A REWOUND
+    /// counter (`current < baseline`, i.e. the driver reloaded) is also `None`
+    /// rather than a clamped `0`: a false "0 s since reset" would read as an
+    /// all-clear when the counters actually restarted.
     pub fn delta_since(&self, base: &CounterSnapshot) -> CounterSnapshot {
         fn d(cur: Option<u64>, base: Option<u64>) -> Option<u64> {
             match (cur, base) {
-                (Some(c), Some(b)) => Some(c.saturating_sub(b)),
+                (Some(c), Some(b)) if c >= b => Some(c - b),
                 _ => None,
             }
         }
@@ -304,9 +305,24 @@ impl CounterSnapshot {
 /// as a string so no extra serde feature is needed for chrono).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThrottleBaseline {
+    #[serde(default)]
     pub ts: String,
+    #[serde(default)]
     pub ai: CounterSnapshot,
+    #[serde(default)]
     pub ai2: CounterSnapshot,
+}
+
+/// Outcome of a baseline capture. `ai`/`ai2` report whether THAT node's
+/// counters were actually read in this pass; `persisted` reports whether the
+/// snapshot reached disk.
+#[derive(Debug, Clone)]
+pub struct ThrottleResetResult {
+    pub baseline: ThrottleBaseline,
+    pub ai: bool,
+    pub ai2: bool,
+    pub persisted: bool,
+    pub persist_error: Option<String>,
 }
 
 /// `<CHRONOS_HOME or ~/chronos>/data/throttle-baseline.json`.
@@ -316,16 +332,20 @@ fn throttle_baseline_path() -> std::path::PathBuf {
         .join("throttle-baseline.json")
 }
 
-/// Best-effort persist (missing dir is created; write errors are ignored so a
-/// read-only/full filesystem never fails the action).
-fn save_throttle_baseline(b: &ThrottleBaseline) {
+/// Persist the baseline atomically (write `<file>.tmp` in the same directory,
+/// then rename — atomic on ext4) and PROPAGATE errors: a baseline that never
+/// reached disk disappears on the next restart, so the caller must not report
+/// success for it.
+fn save_throttle_baseline(b: &ThrottleBaseline) -> std::io::Result<()> {
     let path = throttle_baseline_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(b) {
-        let _ = std::fs::write(&path, text);
-    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("baseline path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let text = serde_json::to_string_pretty(b).map_err(std::io::Error::other)?;
+    let tmp = dir.join("throttle-baseline.json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)
 }
 
 /// Load the persisted baseline (None when absent/unreadable). Used at startup
@@ -335,40 +355,74 @@ pub fn load_throttle_baseline() -> Option<ThrottleBaseline> {
     serde_json::from_str(&text).ok()
 }
 
+/// A capture that produced no usable counters (nvidia-smi missing, timed out,
+/// or the dump had no recognised throttle section) is a failure, not a snapshot
+/// of "everything unknown".
+fn usable(c: Option<CounterSnapshot>) -> Option<CounterSnapshot> {
+    c.filter(|x| !x.is_empty())
+}
+
 /// Capture a NEW throttle baseline for both nodes and persist it.
 ///
-/// Reads `ai` locally and `ai2` over the existing `ssh_ai2` helper. Fails only
-/// when counters are unavailable on BOTH nodes; a single-node capture still
-/// succeeds (the other node's counters are simply `None`).
-pub async fn reset_throttle_baseline() -> Result<ThrottleBaseline, String> {
-    let ai = read_throttle_stat()
-        .await
-        .map(|s| CounterSnapshot::from_stat(&s))
-        .unwrap_or_default();
+/// Reads `ai` locally and `ai2` over the existing `ssh_ai2` helper. Errors only
+/// when counters are unavailable on BOTH nodes. A node whose read failed is
+/// reported as `false` in [`ThrottleResetResult`] and — crucially — its
+/// PREVIOUS baseline values are carried forward if one exists, so a transient
+/// ssh/nvidia-smi failure never overwrites a good snapshot with all-`None`
+/// (which would silently null every `since_reset_us` for that node forever).
+pub async fn reset_throttle_baseline() -> Result<ThrottleResetResult, String> {
+    let ai_new = usable(
+        read_throttle_stat()
+            .await
+            .map(|s| CounterSnapshot::from_stat(&s)),
+    );
 
     // `grep -v '^==='` drops nvidia-smi's banner; harmless here but keeps the
     // remote payload consistent with AI2_BLOB.
-    let ai2 = match tokio::time::timeout(
+    let ai2_new = usable(match tokio::time::timeout(
         Duration::from_secs(SSH_BLOB_TIMEOUT_SECS),
         ssh_ai2("nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -v '^===' || true"),
     )
     .await
     {
-        Ok(Ok(out)) => CounterSnapshot::from_stat(&parse_throttle_stat(&out)),
-        _ => CounterSnapshot::default(),
-    };
+        Ok(Ok(out)) => parse_throttle_stat(&out).map(|s| CounterSnapshot::from_stat(&s)),
+        _ => None,
+    });
 
-    if ai.is_empty() && ai2.is_empty() {
+    if ai_new.is_none() && ai2_new.is_none() {
         return Err("GPU throttle counters unavailable on both ai and ai2".to_string());
     }
 
+    // Capture the per-node outcome BEFORE the options are consumed below, so
+    // the report cannot disagree with what was actually read.
+    let ai_captured = ai_new.is_some();
+    let ai2_captured = ai2_new.is_some();
+
+    let previous = load_throttle_baseline();
+    let ai = ai_new
+        .or_else(|| previous.as_ref().map(|p| p.ai.clone()))
+        .unwrap_or_default();
+    let ai2 = ai2_new
+        .or_else(|| previous.as_ref().map(|p| p.ai2.clone()))
+        .unwrap_or_default();
+
     let baseline = ThrottleBaseline {
-        ts: chrono::Utc::now().to_rfc3339(),
+        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         ai,
         ai2,
     };
-    save_throttle_baseline(&baseline);
-    Ok(baseline)
+    let (persisted, persist_error) = match save_throttle_baseline(&baseline) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(format!("persist failed: {e}"))),
+    };
+
+    Ok(ThrottleResetResult {
+        ai: ai_captured,
+        ai2: ai2_captured,
+        baseline,
+        persisted,
+        persist_error,
+    })
 }
 
 /// Tail the entry's own log file (last `n` lines).

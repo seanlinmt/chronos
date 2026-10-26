@@ -732,7 +732,15 @@ async fn reset_throttle_baseline(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     match state.collector.reset_throttle_baseline().await {
-        Ok(b) => Ok(Json(json!({ "ok": true, "baseline_ts": b.ts }))),
+        Ok(r) => Ok(Json(json!({
+            "ok": true,
+            "baseline_ts": r.baseline.ts,
+            "persisted": r.persisted,
+            "persist_error": r.persist_error,
+            // Per-node capture: a node whose counters could not be read is
+            // reported false rather than folded into a blanket success.
+            "nodes": { "ai": r.ai, "ai2": r.ai2 },
+        }))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))),
     }
 }

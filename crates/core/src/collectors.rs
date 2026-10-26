@@ -372,19 +372,29 @@ fn parse_us(value: &str) -> Option<u64> {
 
 /// Parse `nvidia-smi -q -d PERFORMANCE` into the throttle half of a [`GpuStat`].
 ///
-/// Parsing is SECTION-AWARE because two regions share labels: values before the
-/// `Clocks Event Reasons Counters` header are active flags ("Active"/"Not
-/// Active"), values after it are accumulated µs counters. Label collisions that
-/// must not be confused: "SW Power Cap" (flag) vs "SW Power Capping" (counter),
-/// "Sync Boost" (both), "HW Thermal Slowdown" (both), "SW Thermal Slowdown"
-/// (both). "HW Slowdown" is only a parent flag — its two sub-reasons carry the
-/// real signals — and "Display Clock Setting" has no field in the contract, so
-/// both are ignored rather than invented.
+/// Returns `None` when NEITHER recognised section header is present: that is
+/// the signal that the driver's dump format has changed (or the section was
+/// omitted), so callers can surface "unknown" (null in the JSON contract)
+/// instead of fabricating a green "not throttled". Recognised headers, matched
+/// case-insensitively and tolerant of surrounding whitespace, are:
 ///
-/// Active flags: anything that is not the literal "Not Active" counts as
-/// active (empty values are skipped). Multi-GPU dumps repeat the sections; the
-/// first usable value per field wins.
-pub fn parse_throttle_stat(text: &str) -> GpuStat {
+/// - `Clocks Event Reasons` (current) / `Clocks Throttle Reasons` (older)
+/// - `Clocks Event Reasons Counters` / `Clocks Throttle Reasons Counters`
+///
+/// Parsing is SECTION-AWARE because two regions share labels: values before the
+/// counters header are active flags, values after it are accumulated µs
+/// counters. Label collisions that must not be confused: "SW Power Cap" (flag)
+/// vs "SW Power Capping" (counter), "Sync Boost" (both), "HW Thermal Slowdown"
+/// (both), "SW Thermal Slowdown" (both). "HW Slowdown" is only a parent flag —
+/// its two sub-reasons carry the real signals — and "Display Clock Setting" has
+/// no field in the contract, so both are ignored rather than invented.
+///
+/// Active flags are `"Active"` / `"Not Active"`, compared case-insensitively;
+/// anything else (`[Not Supported]`, `[N/A]`, blank) is `None` — never `true`,
+/// so an unsupported reason does not render as a permanent red chip. Counters
+/// strip a trailing `us` unit. Multi-GPU dumps repeat the sections; the first
+/// usable value per field wins.
+pub fn parse_throttle_stat(text: &str) -> Option<GpuStat> {
     #[derive(Clone, Copy, PartialEq)]
     enum Sec {
         None,
@@ -392,16 +402,20 @@ pub fn parse_throttle_stat(text: &str) -> GpuStat {
         Counters,
     }
     let mut sec = Sec::None;
+    let mut recognised = false;
     let mut stat = GpuStat::default();
     for line in text.lines() {
         let t = line.trim();
-        // Check the counters header first: it starts with the active header.
-        if t.eq_ignore_ascii_case("Clocks Event Reasons Counters") {
+        let lower = t.to_ascii_lowercase();
+        // Counters headers are checked first: they extend the active headers.
+        if lower == "clocks event reasons counters" || lower == "clocks throttle reasons counters" {
             sec = Sec::Counters;
+            recognised = true;
             continue;
         }
-        if t.eq_ignore_ascii_case("Clocks Event Reasons") {
+        if lower == "clocks event reasons" || lower == "clocks throttle reasons" {
             sec = Sec::Active;
+            recognised = true;
             continue;
         }
         match sec {
@@ -410,10 +424,10 @@ pub fn parse_throttle_stat(text: &str) -> GpuStat {
                 let Some((label, value)) = perf_kv(line) else {
                     continue;
                 };
-                let flag = match value {
-                    "" => None,
-                    "Not Active" => Some(false),
-                    _ => Some(true),
+                let flag = match value.to_ascii_lowercase().as_str() {
+                    "active" => Some(true),
+                    "not active" => Some(false),
+                    _ => None,
                 };
                 match label {
                     "Idle" => stat.throttle_idle = stat.throttle_idle.or(flag),
@@ -450,7 +464,11 @@ pub fn parse_throttle_stat(text: &str) -> GpuStat {
             }
         }
     }
-    stat
+    if recognised {
+        Some(stat)
+    } else {
+        None
+    }
 }
 
 /// GPU clock-throttle telemetry from `nvidia-smi -q -d PERFORMANCE`.
@@ -458,7 +476,9 @@ pub fn parse_throttle_stat(text: &str) -> GpuStat {
 /// `clocks_event_reasons_counters.*` via `--query-gpu` is broken on driver
 /// 580.178.04 (returns "Not Active" instead of µs), so the human-readable dump
 /// is the only usable source. It costs ~0.04 s locally / ~0.4 s over SSH.
-/// `None` when nvidia-smi is unavailable or reports nothing usable.
+/// `None` when nvidia-smi is unavailable, the dump has no recognised throttle
+/// section, or nothing usable was parsed. The timeout here is the only one —
+/// callers must NOT wrap this again.
 pub async fn read_throttle_stat() -> Option<GpuStat> {
     let out = tokio::time::timeout(
         Duration::from_secs(CHECK_TIMEOUT_SECS),
@@ -466,7 +486,7 @@ pub async fn read_throttle_stat() -> Option<GpuStat> {
     )
     .await
     .ok()??;
-    let stat = parse_throttle_stat(&out);
+    let stat = parse_throttle_stat(&out)?;
     if stat.has_throttle() {
         Some(stat)
     } else {
@@ -609,24 +629,29 @@ pub async fn ssh_ai2(cmd: &str) -> Result<String, String> {
 
 /// One combined SSH batch for ai2 (meminfo, df, GPU apps,
 /// docker ps, per-PID proc samples, GPU clocks + throttle reasons). Minimizes
-/// SSH calls per tick: adding `-q -d PERFORMANCE` here costs ~0.4 s of the 6 s
-/// blob budget, so it must stay inside this single call.
+/// SSH calls per tick: this is the ONLY ai2 SSH call per tick and both the node
+/// metrics and the per-PID attribution consume its sections. Adding
+/// `-q -d PERFORMANCE` here costs ~0.4 s of the 6 s blob budget.
+///
+/// Every nvidia-smi query is individually wrapped in `timeout 2 … || true` so a
+/// stalled driver query degrades only its own section: without that, one hung
+/// `nvidia-smi` would blow the 6 s blob timeout and null ALL ai2 telemetry.
 ///
 /// `grep -v '^==='` strips nvidia-smi's `==============NVSMI LOG==============`
 /// banner, which `sections()` would otherwise mistake for a section marker and
 /// truncate the THROTTLE payload.
 pub const AI2_BLOB: &str = "echo '===MEMINFO==='; grep -E '^(MemTotal|MemAvailable|Buffers|Cached|SwapTotal|SwapFree):' /proc/meminfo; \
 echo '===DFROOT==='; df -B1 /; \
-echo '===GPUAPPS==='; nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null; \
+echo '===GPUAPPS==='; timeout 2 nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true; \
 echo '===DOCKERPS==='; docker ps --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev/null; \
-echo '===PROCS==='; for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
+echo '===PROCS==='; for p in $(timeout 2 nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
 rss=$(grep VmRSS /proc/$p/status 2>/dev/null | awk '{print $2}'); cg=$(tail -1 /proc/$p/cgroup 2>/dev/null); \
 cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200); echo \"PROC $p ${rss:-0} $cg\"; echo \"CMD $cm\"; done; \
 echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/null | head -200; \
 echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
 echo '===CPUSTAT==='; head -1 /proc/stat; \
-echo '===GPUSTAT==='; nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant --format=csv,noheader,nounits 2>/dev/null || true; \
-echo '===THROTTLE==='; nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -v '^===' || true; \
+echo '===GPUSTAT==='; timeout 2 nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.draw.instant --format=csv,noheader,nounits 2>/dev/null || true; \
+echo '===THROTTLE==='; timeout 2 nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -v '^===' || true; \
 echo '===DOCKER==='; systemctl is-active docker 2>/dev/null || true; \
 echo '===END==='";
 
@@ -659,7 +684,7 @@ pub async fn node_from_blob(
         .unwrap_or_default()
         .with_throttle(
             sec.get("THROTTLE")
-                .map(|s| parse_throttle_stat(s))
+                .and_then(|s| parse_throttle_stat(s))
                 .unwrap_or_default(),
         );
     let load = sec
@@ -715,12 +740,22 @@ pub async fn node_from_blob(
     }
 }
 
-pub async fn collect_nodes(
-    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
-) -> BTreeMap<String, Option<NodeState>> {
-    let mut out = BTreeMap::new();
+/// Fetch the ONE combined ai2 SSH blob for this tick.
+///
+/// Both consumers (node metrics and per-PID attribution) parse this same blob —
+/// never add a second SSH invocation per tick (AGENTS constraint). `None` on
+/// timeout/failure.
+pub async fn fetch_ai2_blob() -> Option<String> {
+    match tokio::time::timeout(Duration::from_secs(SSH_BLOB_TIMEOUT_SECS), ssh_ai2(AI2_BLOB)).await {
+        Ok(Ok(s)) => Some(s),
+        _ => None,
+    }
+}
 
-    // ai — local reads, each timeout-wrapped.
+/// ai node metrics from local reads, each timeout-wrapped.
+pub async fn collect_ai_node(
+    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+) -> Option<NodeState> {
     let meminfo = tokio::time::timeout(Duration::from_secs(CHECK_TIMEOUT_SECS), async {
         tokio::fs::read_to_string("/proc/meminfo").await.map_err(|e| e.to_string())
     })
@@ -748,15 +783,9 @@ pub async fn collect_nodes(
     .unwrap_or_default();
     // Throttle telemetry needs its own `-q -d PERFORMANCE` invocation (~0.04 s
     // local); `clocks_event_reasons_counters.*` via --query-gpu is broken on
-    // this driver. Merged into the same GpuStat.
-    let throttle = tokio::time::timeout(
-        Duration::from_secs(CHECK_TIMEOUT_SECS),
-        read_throttle_stat(),
-    )
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_default();
+    // this driver. `read_throttle_stat` carries the ONLY timeout — do not wrap
+    // it again.
+    let throttle = read_throttle_stat().await.unwrap_or_default();
     let gpu = gpu.with_throttle(throttle);
     let cpu_sample = tokio::time::timeout(
         Duration::from_secs(CHECK_TIMEOUT_SECS),
@@ -774,7 +803,7 @@ pub async fn collect_nodes(
     .await
     .ok()
     .flatten();
-    let ai_node = match (meminfo, df_root) {
+    match (meminfo, df_root) {
         (Ok(Ok(m)), Ok(df)) => {
             let mem = parse_meminfo(&m);
             let disk = df.as_deref().and_then(parse_df);
@@ -813,19 +842,32 @@ pub async fn collect_nodes(
             })
         }
         _ => None,
-    };
-    out.insert("ai".into(), ai_node);
+    }
+}
 
-    // ai2 — single combined ssh blob.
-    let blob = tokio::time::timeout(Duration::from_secs(SSH_BLOB_TIMEOUT_SECS), ssh_ai2(AI2_BLOB)).await;
+/// Both nodes' metrics, fetching the ai2 blob here. Prefer `collect_ai_node` +
+/// `node_from_blob` when a tick already holds the blob (see `state::sys_loop`).
+pub async fn collect_nodes(
+    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+) -> BTreeMap<String, Option<NodeState>> {
+    let blob = fetch_ai2_blob().await;
+    collect_nodes_with_blob(cpu_prev, blob.as_deref()).await
+}
+
+/// Both nodes' metrics from an already-fetched ai2 blob.
+pub async fn collect_nodes_with_blob(
+    cpu_prev: &std::sync::Mutex<BTreeMap<String, (u64, u64)>>,
+    blob: Option<&str>,
+) -> BTreeMap<String, Option<NodeState>> {
+    let mut out = BTreeMap::new();
+    out.insert("ai".into(), collect_ai_node(cpu_prev).await);
     out.insert(
         "ai2".into(),
         match blob {
-            Ok(Ok(s)) => Some(node_from_blob(&s, cpu_prev).await),
-            _ => None,
+            Some(s) => Some(node_from_blob(s, cpu_prev).await),
+            None => None,
         },
     );
-
     out
 }
 
@@ -1016,8 +1058,8 @@ fn parse_remote_procs(s: &str) -> Vec<ProcInfo> {
     out
 }
 
-pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u64, u64)> {
-    // --- ai (local) ---
+/// Per-entry GPU/RSS bytes attributed on `ai` (local reads only).
+pub async fn collect_ai_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, u64> {
     let gpu_ai = run_cmd(
         "nvidia-smi",
         &["--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
@@ -1061,33 +1103,37 @@ pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u6
         }
     }
     let docker_map = parse_docker_ps(&docker_ai);
-    let ai_map = attribute_pids(parse_gpu_apps(&gpu_ai), &docker_map, procs_ai, registry);
+    attribute_pids(parse_gpu_apps(&gpu_ai), &docker_map, procs_ai, registry)
+}
 
-    // --- ai2 (from the same ssh blob used elsewhere; re-run it here) ---
-    let ai2_map = match tokio::time::timeout(Duration::from_secs(SSH_BLOB_TIMEOUT_SECS), ssh_ai2(AI2_BLOB)).await {
-        Ok(Ok(blob)) => {
-            let sec = sections(&blob);
-            let gpu = sec.get("GPUAPPS").map(|s| parse_gpu_apps(s)).unwrap_or_default();
-            let docker = sec
-                .get("DOCKERPS")
-                .map(|s| parse_docker_ps(s))
-                .unwrap_or_default();
-            let mut procs = sec.get("PROCS").map(|s| parse_remote_procs(s)).unwrap_or_default();
-            // CPU-only services never appear in GPUAPPS, so fold in the full
-            // process list and let the `process_match` second pass attribute
-            // them by RSS.
-            if let Some(list) = sec.get("CPUPROCS") {
-                for p in parse_cpu_procs(list) {
-                    if !procs.iter().any(|q| q.pid == p.pid) {
-                        procs.push(p);
-                    }
-                }
+/// Per-entry bytes attributed on `ai2` from an already-fetched blob (pure
+/// parsing — no I/O).
+pub fn ai2_mem_attr(blob: &str, registry: &[RegistryEntry]) -> HashMap<String, u64> {
+    let sec = sections(blob);
+    let gpu = sec.get("GPUAPPS").map(|s| parse_gpu_apps(s)).unwrap_or_default();
+    let docker = sec
+        .get("DOCKERPS")
+        .map(|s| parse_docker_ps(s))
+        .unwrap_or_default();
+    let mut procs = sec.get("PROCS").map(|s| parse_remote_procs(s)).unwrap_or_default();
+    // CPU-only services never appear in GPUAPPS, so fold in the full process
+    // list and let the `process_match` second pass attribute them by RSS.
+    if let Some(list) = sec.get("CPUPROCS") {
+        for p in parse_cpu_procs(list) {
+            if !procs.iter().any(|q| q.pid == p.pid) {
+                procs.push(p);
             }
-            attribute_pids(gpu, &docker, procs, registry)
         }
-        _ => HashMap::new(),
-    };
+    }
+    attribute_pids(gpu, &docker, procs, registry)
+}
 
+/// Combine per-node attribution into the `(ai, ai2)` map for every registry id.
+pub fn merge_mem_attr(
+    registry: &[RegistryEntry],
+    ai_map: &HashMap<String, u64>,
+    ai2_map: &HashMap<String, u64>,
+) -> HashMap<String, (u64, u64)> {
     let mut ids: Vec<String> = registry.iter().map(|e| e.id.clone()).collect();
     ids.extend(ai_map.keys().cloned());
     ids.extend(ai2_map.keys().cloned());
@@ -1098,4 +1144,202 @@ pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u6
         out.insert(id, (a, b));
     }
     out
+}
+
+/// Both nodes' attribution, fetching the ai2 blob here. Prefer the split
+/// functions when a tick already holds the blob.
+pub async fn collect_mem_attr(registry: &[RegistryEntry]) -> HashMap<String, (u64, u64)> {
+    let blob = fetch_ai2_blob().await;
+    collect_mem_attr_with_blob(registry, blob.as_deref()).await
+}
+
+/// Both nodes' attribution from an already-fetched ai2 blob.
+pub async fn collect_mem_attr_with_blob(
+    registry: &[RegistryEntry],
+    blob: Option<&str>,
+) -> HashMap<String, (u64, u64)> {
+    let ai_map = collect_ai_mem_attr(registry).await;
+    let ai2_map = blob.map(|b| ai2_mem_attr(b, registry)).unwrap_or_default();
+    merge_mem_attr(registry, &ai_map, &ai2_map)
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// Current-driver dump shape (`Clocks Event Reasons` headers), built from
+    /// (label, value) pairs so the label collisions can be exercised directly.
+    fn event_dump(active: &[(&str, &str)], counters: &[(&str, &str)]) -> String {
+        let mut s = String::from("    Clocks Event Reasons\n");
+        for (label, value) in active {
+            s.push_str(&format!("        {label:<47}: {value}\n"));
+        }
+        s.push_str("    Clocks Event Reasons Counters\n");
+        for (label, value) in counters {
+            s.push_str(&format!("        {label:<47}: {value}\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn active_flags_are_parsed() {
+        let d = event_dump(
+            &[
+                ("Idle", "Not Active"),
+                ("Applications Clocks Setting", "Not Active"),
+                ("SW Power Cap", "Active"),
+                ("HW Slowdown", "Not Active"),
+                ("HW Thermal Slowdown", "Active"),
+                ("HW Power Brake Slowdown", "Not Active"),
+                ("Sync Boost", "Not Active"),
+                ("SW Thermal Slowdown", "Not Active"),
+                ("Display Clock Setting", "Not Active"),
+            ],
+            &[("SW Power Capping", "3009336802 us")],
+        );
+        let st = parse_throttle_stat(&d).expect("recognised section");
+        assert_eq!(st.throttle_sw_power_cap, Some(true));
+        assert_eq!(st.throttle_hw_thermal, Some(true));
+        assert_eq!(st.throttle_hw_power_brake, Some(false));
+        assert_eq!(st.throttle_idle, Some(false));
+        assert_eq!(st.throttle_app_clocks, Some(false));
+        assert_eq!(st.throttle_sync_boost, Some(false));
+        assert_eq!(st.throttle_sw_thermal, Some(false));
+        assert_eq!(st.sw_power_cap_us, Some(3_009_336_802));
+        // Counters absent from this dump stay None.
+        assert_eq!(st.sw_thermal_us, None);
+        assert_eq!(st.sync_boost_us, None);
+        assert_eq!(st.hw_thermal_us, None);
+        assert_eq!(st.hw_power_brake_us, None);
+    }
+
+    #[test]
+    fn counters_only_dump_parses() {
+        let d = r#"    Clocks Event Reasons Counters
+        SW Power Capping                               : 3009336802 us
+        Sync Boost                                     : 0 us
+        SW Thermal Slowdown                            : 15169743 us
+        HW Thermal Slowdown                            : N/A
+        HW Power Braking                               : 0 us
+"#;
+        let st = parse_throttle_stat(d).expect("counters-only section recognised");
+        assert_eq!(st.sw_power_cap_us, Some(3_009_336_802));
+        assert_eq!(st.sync_boost_us, Some(0));
+        assert_eq!(st.sw_thermal_us, Some(15_169_743));
+        assert_eq!(st.hw_thermal_us, None, "N/A must not become a number");
+        assert_eq!(st.hw_power_brake_us, Some(0));
+        // No active section in this dump → active flags unknown, never false.
+        assert_eq!(st.throttle_sw_power_cap, None);
+        assert_eq!(st.throttle_idle, None);
+    }
+
+    #[test]
+    fn old_throttle_reasons_spelling_is_recognised() {
+        let d = r#"    Clocks Throttle Reasons
+        SW Power Cap                                   : Active
+        HW Thermal Slowdown                            : Not Active
+    Clocks Throttle Reasons Counters
+        SW Power Capping                               : 12 us
+        HW Power Braking                               : 34 us
+"#;
+        let st = parse_throttle_stat(d).expect("old header spelling must be recognised");
+        assert_eq!(st.throttle_sw_power_cap, Some(true));
+        assert_eq!(st.throttle_hw_thermal, Some(false));
+        assert_eq!(st.sw_power_cap_us, Some(12));
+        assert_eq!(st.hw_power_brake_us, Some(34));
+    }
+
+    #[test]
+    fn unrecognised_section_is_none() {
+        // Empty output (nvidia-smi failed / `timeout` killed it).
+        assert!(parse_throttle_stat("").is_none());
+        // A driver that renames or drops the section must NOT read as
+        // "not throttled" — it must read as unknown.
+        assert!(parse_throttle_stat("Attached GPUs : 1\nGPU 00000000:01:00.0\n").is_none());
+        assert!(parse_throttle_stat("    Clocks Throttle Reason\n        Idle : Active\n").is_none());
+    }
+
+    #[test]
+    fn unsupported_values_are_unknown_not_throttled() {
+        let d = r#"    Clocks Event Reasons
+        SW Power Cap                                   : [Not Supported]
+        HW Thermal Slowdown                            : [N/A]
+        Idle                                           : 
+        Sync Boost                                     : Active
+"#;
+        let st = parse_throttle_stat(d).expect("recognised section");
+        assert_eq!(st.throttle_sw_power_cap, None);
+        assert_eq!(st.throttle_hw_thermal, None);
+        assert_eq!(st.throttle_idle, None);
+        assert_eq!(st.throttle_sync_boost, Some(true));
+    }
+
+    #[test]
+    fn label_collisions_stay_in_their_section() {
+        let d = r#"    Clocks Event Reasons
+        SW Power Cap                                   : Active
+        Sync Boost                                     : Not Active
+        HW Thermal Slowdown                            : Not Active
+        SW Thermal Slowdown                            : Active
+    Clocks Event Reasons Counters
+        SW Power Capping                               : 3009336802 us
+        Sync Boost                                     : 77 us
+        HW Thermal Slowdown                            : 88 us
+        SW Thermal Slowdown                            : 99 us
+"#;
+        let st = parse_throttle_stat(d).expect("recognised section");
+        assert_eq!(st.throttle_sw_power_cap, Some(true));
+        assert_eq!(st.throttle_sync_boost, Some(false));
+        assert_eq!(st.throttle_hw_thermal, Some(false));
+        assert_eq!(st.throttle_sw_thermal, Some(true));
+        assert_eq!(st.sw_power_cap_us, Some(3_009_336_802));
+        assert_eq!(st.sync_boost_us, Some(77));
+        assert_eq!(st.hw_thermal_us, Some(88));
+        assert_eq!(st.sw_thermal_us, Some(99));
+    }
+
+    #[test]
+    fn nested_hw_slowdown_parent_is_not_a_field() {
+        // "HW Slowdown" is a rollup; only its sub-reasons carry signals.
+        let d = r#"    Clocks Event Reasons
+        HW Slowdown                                    : Active
+            HW Thermal Slowdown                        : Not Active
+            HW Power Brake Slowdown                    : Not Active
+"#;
+        let st = parse_throttle_stat(d).expect("recognised section");
+        assert_eq!(st.throttle_hw_thermal, Some(false));
+        assert_eq!(st.throttle_hw_power_brake, Some(false));
+    }
+
+    #[test]
+    fn us_suffix_variants() {
+        let d = r#"    Clocks Event Reasons Counters
+        SW Power Capping                               : 7us
+        Sync Boost                                     : 0 us
+        SW Thermal Slowdown                            : 
+        HW Thermal Slowdown                            : [Not Supported]
+"#;
+        let st = parse_throttle_stat(d).expect("recognised section");
+        assert_eq!(st.sw_power_cap_us, Some(7));
+        assert_eq!(st.sync_boost_us, Some(0));
+        assert_eq!(st.sw_thermal_us, None);
+        assert_eq!(st.hw_thermal_us, None);
+    }
+
+    #[test]
+    fn multi_gpu_first_usable_value_wins() {
+        let d = r#"    Clocks Event Reasons
+        SW Power Cap                                   : Not Active
+    Clocks Event Reasons Counters
+        SW Power Capping                               : 10 us
+    GPU 00000000:02:00.0
+    Clocks Event Reasons
+        SW Power Cap                                   : Active
+    Clocks Event Reasons Counters
+        SW Power Capping                               : 99 us
+"#;
+        let st = parse_throttle_stat(d).expect("recognised section");
+        assert_eq!(st.throttle_sw_power_cap, Some(false));
+        assert_eq!(st.sw_power_cap_us, Some(10));
+    }
 }

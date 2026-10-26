@@ -57,6 +57,9 @@
   .pill.off  { background: rgba(239,68,68,.12);  color: var(--red); }
   .pill.warn { background: rgba(245,158,11,.12); color: var(--amber); }
   .pill.idle { background: rgba(139,148,167,.12); color: var(--muted); }
+  /* Long pill copy (a list of reasons) wraps inside the pill instead of
+     running past the card edge. */
+  .pill.wrap { flex-wrap: wrap; white-space: normal; text-align: left; border-radius: 8px; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 5px;
     font-size: 11px; font-weight: 700; letter-spacing: .5px;
@@ -710,8 +713,37 @@ async function resetThrottleBaseline() {
   renderAll(lastData);
   try {
     const r = await api('/api/cluster/reset-throttle-baseline', { method: 'POST' });
+
+    // Per-node capture report: a node whose counters could not be read is named
+    // on its own, never folded into a blanket success.
+    const nodes = r && r.nodes ? r.nodes : null;
+    const captured = [];
+    const failed = [];
+    if (nodes) {
+      for (const n of ['ai', 'ai2']) {
+        if (nodes[n] === true) captured.push(n);
+        else if (nodes[n] === false) failed.push(n);
+      }
+    }
+
     const at = fmtBaselineTs(r && r.baseline_ts);
-    toast(at ? `Throttle baseline set to ${at}` : 'Throttle baseline set');
+    let msg;
+    if (captured.length && failed.length) {
+      msg = `baseline set for ${captured.join(' + ')}; ${failed.join(' + ')} counters unavailable`;
+    } else if (captured.length) {
+      msg = `baseline set for ${captured.join(' + ')}`;
+    } else if (failed.length) {
+      msg = `baseline not captured for ${failed.join(' + ')}`;
+    } else {
+      msg = 'throttle baseline set';
+    }
+    if (at) msg += ` at ${at}`;
+
+    // A baseline that is not persisted only lives until the service restarts.
+    const persisted = !(r && r.persisted === false);
+    if (!persisted) msg += ' — not persisted, lost on restart';
+    toast(msg, persisted ? 'ok' : 'err');
+
     await poll();
   } catch (e) {
     toast(`Reset baseline failed: ${e.message}`, 'err');
@@ -736,6 +768,30 @@ const THROTTLE_REASONS = [
   { key: 'sw_power_cap',            label: 'power cap',           level: 'sw' },
   { key: 'sync_boost',              label: 'sync boost',          level: 'sw' },
 ];
+
+/* applications_clocks_setting is a real limiter (an application pinned the
+   clocks), so it gets a chip, but the contract gives it no lifetime counter —
+   it therefore never appears in the counters table below. */
+const THROTTLE_CHIP_REASONS = [
+  ...THROTTLE_REASONS,
+  { key: 'applications_clocks_setting', label: 'app clock limit', level: 'sw' },
+];
+
+/* Headline latch. `active` is a 2 s point sample, so a cap that starts and ends
+   between two polls never shows there; counters_us only move forward, so growth
+   between consecutive polls is the honest signal. Growth holds "capped
+   recently" for 60 s and the latch can only be extended, never shortened.
+   Tracking is per node and is dropped when the baseline moves. */
+const THROTTLE_DWELL_MS = 60000;
+const throttleTrack = {
+  ai:  { baseline: null, prev: null, latch: null },
+  ai2: { baseline: null, prev: null, latch: null },
+};
+
+function throttleTrackFor(name) {
+  if (!throttleTrack[name]) throttleTrack[name] = { baseline: null, prev: null, latch: null };
+  return throttleTrack[name];
+}
 
 const THROTTLE_MISSING = '—';
 
@@ -773,21 +829,88 @@ function fmtBaselineTs(ts) {
   return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())} local`;
 }
 
-/* Active-state row: one calm green "no throttle" when nothing is set, otherwise
-   every active reason as its own chip — red for hardware slowdowns, amber for
-   software ones. A node with no throttle object at all reads "throttle —". */
-function throttleChips(t) {
-  const active = t && t.active ? t.active : null;
-  if (!active) {
-    return el('span', { class: 'pill idle', title: 'no throttle telemetry from this node' }, 'throttle —');
+/* Called once per successful /api/state fetch, never from a re-render, so a
+   counter is only ever compared against the previous poll. */
+function recordThrottle(nodes, baselineTs) {
+  const base = baselineTs || null;
+  for (const name of ['ai', 'ai2']) {
+    const st = throttleTrackFor(name);
+
+    // A new baseline is a new epoch: reseed and drop the latch so no growth is
+    // inferred across the reset.
+    if (st.baseline !== base) {
+      st.baseline = base;
+      st.prev = null;
+      st.latch = null;
+    }
+
+    const n = nodes ? nodes[name] : null;
+    const t = n && n.throttle ? n.throttle : null;
+    const counters = t && t.counters_us ? t.counters_us : null;
+
+    const grew = [];
+    if (counters && st.prev) {
+      for (const r of THROTTLE_REASONS) {
+        const now = numOrNull(counters[r.key]);
+        const before = numOrNull(st.prev[r.key]);
+        if (now != null && before != null && now > before) grew.push(r.key);
+      }
+    }
+    st.prev = counters ? Object.assign({}, counters) : null;
+
+    if (grew.length) {
+      const until = Date.now() + THROTTLE_DWELL_MS;
+      const reasons = new Set(st.latch ? st.latch.reasons : []);
+      for (const k of grew) reasons.add(k);
+      st.latch = { until: st.latch ? Math.max(st.latch.until, until) : until, reasons };
+    }
   }
-  const live = THROTTLE_REASONS.filter((r) => active[r.key] === true);
-  if (!live.length) return el('span', { class: 'pill on' }, 'no throttle');
-  return el('span', { class: 'row', style: 'gap:4px' },
-    live.map((r) => el('span', { class: `thr-chip ${r.level}`, title: `active: ${r.key}` }, r.label)));
 }
 
-function throttleBlock(name, cur, baselineTs) {
+/* Returns the latch only while it is still inside its dwell window; an expired
+   latch is dropped here and never cleared early. */
+function throttleLatch(name) {
+  const st = throttleTrackFor(name);
+  if (!st.latch) return null;
+  if (Date.now() >= st.latch.until) { st.latch = null; return null; }
+  return st.latch;
+}
+
+/* Headline. Unknown never looks healthy: a stale node, a missing throttle
+   object or an all-null flag set all read "throttle —" in grey. Green "no
+   throttle" requires at least one flag that is a real false. */
+function throttleChips(name, t, stale) {
+  const unknown = (title) => el('span', { class: 'pill idle', title }, 'throttle —');
+
+  if (stale) return unknown('node unreachable — showing the last reading');
+
+  const active = t && t.active ? t.active : null;
+  if (!active) return unknown('no throttle telemetry from this node');
+
+  // One real boolean proves the read worked; all-null means it did not.
+  if (!THROTTLE_CHIP_REASONS.some((r) => typeof active[r.key] === 'boolean')) {
+    return unknown('throttle flags unavailable');
+  }
+
+  const live = THROTTLE_CHIP_REASONS.filter((r) => active[r.key] === true);
+  if (live.length) {
+    return el('span', { class: 'row', style: 'gap:4px' },
+      live.map((r) => el('span', { class: `thr-chip ${r.level}`, title: `active: ${r.key}` }, r.label)));
+  }
+
+  const latch = throttleLatch(name);
+  if (latch) {
+    const names = THROTTLE_CHIP_REASONS.filter((r) => latch.reasons.has(r.key)).map((r) => r.label);
+    return el('span', {
+      class: 'pill warn wrap',
+      title: 'counters grew within the last 60 s; no throttle flag is active in this sample',
+    }, `capped recently: ${names.join(', ')}`);
+  }
+
+  return el('span', { class: 'pill on' }, 'no throttle');
+}
+
+function throttleBlock(name, cur, stale, baselineTs) {
   const t = cur && cur.throttle ? cur.throttle : null;
   const counters = t && t.counters_us ? t.counters_us : null;
   const since = t && t.since_reset_us ? t.since_reset_us : null;
@@ -825,7 +948,7 @@ function throttleBlock(name, cur, baselineTs) {
     el('div', { class: 'row', style: 'margin-bottom:2px' },
       el('span', { class: 'muted small' }, 'GPU throttle'),
       el('div', { class: 'spacer' }),
-      throttleChips(t)),
+      throttleChips(name, t, stale)),
     el('div', { class: 'thr-rows' }, ...cells),
     el('div', { class: 'muted small thr-note' }, note));
 }
@@ -895,7 +1018,7 @@ function nodeCard(name, role, cur, stale, baselineTs) {
 
   // Throttle telemetry is appended after every existing row so the card's
   // layout (headline gauges, stat grid) is untouched.
-  card.append(throttleBlock(name, cur, baselineTs));
+  card.append(throttleBlock(name, cur, stale, baselineTs));
 
   return card;
 }
@@ -1764,18 +1887,44 @@ function renderAll(data) {
   renderTable(data.entries || []);
 }
 
-async function poll() {
+async function fetchState() {
   try {
     const data = await api('/api/state');
     lastData = data;
     recordThermal(data.nodes);
+    recordThrottle(data.nodes, data.throttle_baseline_ts);
     $('#errbanner').classList.remove('show');
     renderAll(data);
+    return true;
   } catch {
     $('#errbanner').classList.add('show');
-  } finally {
-    setTimeout(poll, 2000);
+    return false;
   }
+}
+
+/* One owned 2 s chain. Every arm cancels the previous timer first, so a manual
+   refresh can never leave a second loop running; a cycle that is already in
+   flight keeps ownership of the next tick. */
+const POLL_MS = 2000;
+let pollTimer = null;
+let pollRunning = false;
+
+function armPoll(delay = POLL_MS) {
+  if (pollTimer != null) clearTimeout(pollTimer);
+  pollTimer = setTimeout(() => { pollTimer = null; runPoll(); }, delay);
+}
+
+async function runPoll() {
+  if (pollRunning) return;          // the in-flight cycle re-arms
+  pollRunning = true;
+  try { await fetchState(); } finally { pollRunning = false; }
+  if (pollTimer == null) armPoll();
+}
+
+/* Manual refresh: cancel the pending tick, fetch once, re-arm the one chain. */
+async function poll() {
+  if (pollTimer != null) { clearTimeout(pollTimer); pollTimer = null; }
+  await runPoll();
 }
 
 /* ============================ wiring ============================ */
