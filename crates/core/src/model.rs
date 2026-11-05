@@ -174,6 +174,9 @@ pub struct Prev {
     pub total: Option<u64>,
     pub decode_s: Option<f64>,
     pub at: Option<Instant>,
+    /// Previous `velogb10_scheduler_steps_total` read (aggregate scheduler
+    /// step counter; unused by the other engines, which never populate it).
+    pub steps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
