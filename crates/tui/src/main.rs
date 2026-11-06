@@ -45,6 +45,7 @@ struct AddModal {
     port: String,
     slot: String,
     engine: String,
+    tp: String,
     host: String,
     containers: Vec<String>,
     process_match: Option<String>,
@@ -63,6 +64,7 @@ impl AddModal {
             port: "8888".into(),
             slot: "primary-llm".into(),
             engine: "vllm".into(),
+            tp: String::new(),
             host: AI_LAN.into(),
             containers: vec![],
             process_match: None,
@@ -81,6 +83,7 @@ impl AddModal {
             port: entry.port.to_string(),
             slot: entry.slot.clone(),
             engine: entry.engine.clone(),
+            tp: entry.tp.map(|t| t.to_string()).unwrap_or_default(),
             host: entry.host.clone(),
             containers: entry.containers.clone(),
             process_match: entry.process_match.clone(),
@@ -92,13 +95,14 @@ impl AddModal {
         }
     }
 
-    fn fields(&mut self) -> [&mut String; 5] {
+    fn fields(&mut self) -> [&mut String; 6] {
         [
             &mut self.path,
             &mut self.id,
             &mut self.port,
             &mut self.slot,
             &mut self.engine,
+            &mut self.tp,
         ]
     }
 
@@ -125,6 +129,7 @@ impl AddModal {
             engine: self.engine.trim().to_string(),
             containers: self.containers.clone(),
             process_match: self.process_match.clone(),
+            tp: self.tp.trim().parse::<u8>().ok(),
         }
     }
 }
@@ -376,8 +381,15 @@ fn draw_nodes(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout
     let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     let ai = app.nodes.get("ai").cloned().flatten();
     let ai2 = app.nodes.get("ai2").cloned().flatten();
-    draw_node_half(f, "ai (head · 192.168.20.63)", &ai, halves[0]);
-    draw_node_half(f, "ai2 (worker · 192.168.20.229)", &ai2, halves[1]);
+    let is_tp1 = app.entries.iter().any(|e| {
+        e.state == "RUNNING"
+            && (e.slot == "primary-llm" || e.port == 8888)
+            && (e.tp == Some(1) || e.id.ends_with("-tp1"))
+    });
+    let label_ai = if is_tp1 { "ai (192.168.20.63)" } else { "ai (head · 192.168.20.63)" };
+    let label_ai2 = if is_tp1 { "ai2 (192.168.20.229)" } else { "ai2 (worker · 192.168.20.229)" };
+    draw_node_half(f, label_ai, &ai, halves[0]);
+    draw_node_half(f, label_ai2, &ai2, halves[1]);
 }
 
 fn draw_endpoints(f: &mut Frame, app: &chronos_core::AppState, area: ratatui::layout::Rect) {
@@ -554,10 +566,10 @@ fn draw_confirm(f: &mut Frame, c: &Confirm, area: ratatui::layout::Rect) {
 }
 
 fn draw_add_modal(f: &mut Frame, m: &AddModal, area: ratatui::layout::Rect) {
-    let r = centered(area, 70, 12);
+    let r = centered(area, 70, 13);
     f.render_widget(Clear, r);
-    let labels = ["Path", "ID", "Port", "Slot", "Engine"];
-    let values = [&m.path, &m.id, &m.port, &m.slot, &m.engine];
+    let labels = ["Path", "ID", "Port", "Slot", "Engine", "TP"];
+    let values = [&m.path, &m.id, &m.port, &m.slot, &m.engine, &m.tp];
     let mut lines: Vec<Line> = Vec::new();
     for (i, (l, v)) in labels.iter().zip(values.iter()).enumerate() {
         let focused = i == m.focus;
@@ -645,7 +657,7 @@ fn handle_key(
                     }
                     let _ = model;
                 }
-                m.focus = (m.focus + 1) % 5;
+                m.focus = (m.focus + 1) % 6;
             }
             KeyCode::Enter => {
                 if m.focus == 0 {

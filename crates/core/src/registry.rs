@@ -16,6 +16,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
             engine: "tensorfold".into(),
             containers: vec!["glm53-tf-r0".into(), "glm53-tf-r1".into()],
             process_match: None,
+            tp: Some(2),
         },
         RegistryEntry {
             id: "DeepSeek-v4.1-Flash-2x-DGX-Spark".into(),
@@ -28,6 +29,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
             engine: "vllm".into(),
             containers: vec![],
             process_match: None,
+            tp: Some(2),
         },
         RegistryEntry {
             id: "veloGB10 (Qwen3.8-Flash-Next)".into(),
@@ -40,6 +42,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
             engine: "velogb10".into(),
             containers: vec![],
             process_match: Some("gb10_inference".into()),
+            tp: Some(2),
         },
         RegistryEntry {
             id: "launch-embedding-ai.sh (BGE-M3)".into(),
@@ -52,6 +55,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
             engine: "vllm".into(),
             containers: vec![],
             process_match: Some("chronos-embed".into()),
+            tp: None,
         },
         RegistryEntry {
             id: "launch-reranker-ai2.sh (BGE-Reranker-v2-M3)".into(),
@@ -64,6 +68,7 @@ pub fn seed_registry() -> Vec<RegistryEntry> {
             engine: "vllm".into(),
             containers: vec![],
             process_match: Some("chronos-rerank".into()),
+            tp: None,
         },
     ]
 }

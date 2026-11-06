@@ -75,6 +75,7 @@ pub fn assemble(
             containers: e.containers.clone(),
             served_model: p.and_then(|x| x.served_model.clone()),
             status_detail: p.and_then(|x| x.detail.clone()),
+            tp: e.tp.or_else(|| p.and_then(|x| x.tp)).or_else(|| e.effective_tp()),
             mem_ai_bytes: m_ai,
             mem_ai2_bytes: m_ai2,
             mem_total_bytes: m_ai + m_ai2,

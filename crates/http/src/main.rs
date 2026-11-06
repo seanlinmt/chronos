@@ -249,6 +249,7 @@ fn entry_dto(e: &RegistryEntry, snap: Option<&chronos_core::EntrySnapshot>, web:
         "engine": e.engine,
         "containers": e.containers,
         "process_match": e.process_match,
+        "tp": e.tp.or_else(|| snap.and_then(|s| s.tp)).or_else(|| e.effective_tp()),
         "status": status,
         "status_detail": snap.and_then(|s| s.status_detail.clone()),
         "uptime_s": uptime,
@@ -331,6 +332,8 @@ struct EntryInput {
     containers: Vec<String>,
     #[serde(default)]
     process_match: Option<String>,
+    #[serde(default)]
+    tp: Option<u8>,
 }
 
 fn default_host() -> String {
@@ -372,6 +375,7 @@ async fn add_entry(
         engine,
         containers: input.containers,
         process_match: input.process_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        tp: input.tp,
     };
 
     if state.collector.find(&entry.id).is_some() {
@@ -442,6 +446,7 @@ async fn update_entry(
         engine,
         containers: input.containers,
         process_match: input.process_match.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        tp: input.tp,
     };
 
     if new_id != id {
@@ -580,6 +585,7 @@ async fn inspect_entry(Json(body): Json<Value>) -> Result<Json<Value>, (StatusCo
             "engine": engine,
             "containers": containers,
             "process_match": Value::Null,
+            "tp": Value::Null,
         }
     })))
 }

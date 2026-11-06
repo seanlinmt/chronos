@@ -40,6 +40,40 @@ pub struct RegistryEntry {
     pub containers: Vec<String>,
     #[serde(default)]
     pub process_match: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp: Option<u8>,
+}
+
+impl RegistryEntry {
+    /// Return explicit `tp` if configured, or infer from start command / id / containers.
+    pub fn effective_tp(&self) -> Option<u8> {
+        if let Some(tp) = self.tp {
+            return Some(tp);
+        }
+        let start = self.start.trim();
+        if start.contains("launch_qwen38_flash_next.sh 1") || start.contains("--tp 1") {
+            return Some(1);
+        }
+        if start.contains("launch_qwen38_flash_next.sh 2") || start.contains("--tp 2") {
+            return Some(2);
+        }
+        if start.contains("launch_qwen38_flash_next.sh 4") || start.contains("--tp 4") {
+            return Some(4);
+        }
+        if self.id.ends_with("-tp1") || self.id.ends_with("_tp1") {
+            return Some(1);
+        }
+        if self.id.ends_with("-tp2") || self.id.ends_with("_tp2") {
+            return Some(2);
+        }
+        if self.id.ends_with("-tp4") || self.id.ends_with("_tp4") {
+            return Some(4);
+        }
+        if self.containers.len() > 1 {
+            return Some(self.containers.len() as u8);
+        }
+        None
+    }
 }
 
 pub fn default_engine() -> String {
@@ -148,6 +182,8 @@ pub struct EntrySnapshot {
     pub containers: Vec<String>,
     pub served_model: Option<String>,
     pub status_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tp: Option<u8>,
     pub mem_ai_bytes: u64,
     pub mem_ai2_bytes: u64,
     pub mem_total_bytes: u64,
@@ -184,6 +220,7 @@ pub struct ProbeResult {
     pub ok: bool,
     pub detail: Option<String>,
     pub served_model: Option<String>,
+    pub tp: Option<u8>,
     pub concurrent: Option<u64>,
     pub queued: Option<u64>,
     pub live_tok_per_sec: Option<f64>,

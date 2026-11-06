@@ -453,8 +453,19 @@
         </select>
       </div>
     </div>
+    <div class="field half">
+      <div><label for="f-tp">TP (Tensor Parallelism)</label>
+        <select id="f-tp">
+          <option value="">— (auto / none)</option>
+          <option value="1">TP 1 (single node)</option>
+          <option value="2">TP 2 (2 nodes)</option>
+          <option value="4">TP 4 (4 nodes)</option>
+          <option value="8">TP 8 (8 nodes)</option>
+        </select>
+      </div>
+      <div><label for="f-procmatch">Process match (optional)</label><input id="f-procmatch" type="text" placeholder="e.g. vllm serve"></div>
+    </div>
     <div class="field"><label for="f-containers">Containers (comma-separated)</label><input id="f-containers" type="text" placeholder="glm-r0, glm-r1"></div>
-    <div class="field"><label for="f-procmatch">Process match (optional)</label><input id="f-procmatch" type="text" placeholder="e.g. vllm serve"></div>
     <div class="form-err" id="add-err"></div>
     <div class="row" style="justify-content:flex-end">
       <button class="btn icon" id="btn-cancel" type="button" aria-label="Cancel" title="Cancel"><svg class="ic" width="16" height="16" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><use href="#ic-close"/></svg></button>
@@ -973,8 +984,9 @@ function nodeCard(name, role, cur, stale, baselineTs) {
       })
     : null;
 
+  const title = role ? `${name} — ${role}` : name;
   card.append(el('div', { class: 'row', style: 'margin-bottom:10px; gap:8px' },
-    el('h3', {}, `${name} — ${role}`),
+    el('h3', {}, title),
     el('div', { class: 'spacer' }),
     dockerPill,
     startDockerBtn));
@@ -1023,7 +1035,7 @@ function nodeCard(name, role, cur, stale, baselineTs) {
   return card;
 }
 
-function renderNodes(nodes, baselineTs) {
+function renderNodes(nodes, baselineTs, entries) {
   const wrap = $('#nodes');
   wrap.replaceChildren();
 
@@ -1036,8 +1048,11 @@ function renderNodes(nodes, baselineTs) {
   const aiStale = !ai || ai.mem_total_bytes == null;
   const ai2Stale = !ai2 || ai2.mem_total_bytes == null;
 
-  wrap.append(nodeCard('ai', 'Head', aiStale ? lastNodes.ai : ai, aiStale, baselineTs));
-  wrap.append(nodeCard('ai2', 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale, baselineTs));
+  const activeLlm = (entries || []).find((e) => e.status === 'RUNNING' && (e.slot === 'primary-llm' || e.port === 8888));
+  const isTp1 = Boolean(activeLlm && (activeLlm.tp === 1 || activeLlm.id.endsWith('-tp1')));
+
+  wrap.append(nodeCard('ai', isTp1 ? null : 'Head', aiStale ? lastNodes.ai : ai, aiStale, baselineTs));
+  wrap.append(nodeCard('ai2', isTp1 ? null : 'Worker', ai2Stale ? lastNodes.ai2 : ai2, ai2Stale, baselineTs));
 }
 
 /* ============================ thermal & load ============================ */
@@ -1144,7 +1159,7 @@ function buildThermalPanels() {
     });
 
     wrap.append(el('div', { class: 'card', style: 'background:#0d1118' },
-      el('div', { class: 'row' }, el('h3', {}, `${spec.name} — ${spec.role}`)),
+      el('div', { class: 'row' }, el('h3', { 'data-thermal-node': spec.name }, `${spec.name} — ${spec.role}`)),
       el('div', { class: 'readouts' }, ...cells),
       canvas,
       el('div', { class: 'legend' }, ...orderedSeries().map((s) => {
@@ -1314,9 +1329,18 @@ function drawThermalChart(canvas, points, windowSec) {
   }
 }
 
-function renderThermal(nodes) {
+function renderThermal(nodes, entries) {
   buildThermalPanels();
   if (nodes) lastThermalNodes = nodes;
+
+  const activeLlm = (entries || []).find((e) => e.status === 'RUNNING' && (e.slot === 'primary-llm' || e.port === 8888));
+  const isTp1 = Boolean(activeLlm && (activeLlm.tp === 1 || activeLlm.id.endsWith('-tp1')));
+  for (const spec of [{ name: 'ai', role: 'Head' }, { name: 'ai2', role: 'Worker' }]) {
+    const titleEl = $(`[data-thermal-node="${spec.name}"]`);
+    if (titleEl) {
+      titleEl.textContent = isTp1 ? spec.name : `${spec.name} — ${spec.role}`;
+    }
+  }
 
   for (const name of ['ai', 'ai2']) {
     updateThermalPanel(name, nodes ? nodes[name] : null);
@@ -1410,7 +1434,7 @@ function renderActive(entries) {
         el('div', { class: 'spacer' }),
         statusBadge(e.status)),
       el('div', { class: 'muted small mono' },
-        `serving: ${e.served_model || e.name} · ${e.host}:${e.port} · up ${fmtUptime(e.uptime_s)}`),
+        `serving: ${e.served_model || e.name}${e.tp ? ` · TP ${e.tp}` : ''} · ${e.host}:${e.port} · up ${fmtUptime(e.uptime_s)}`),
       el('div', { class: 'ep-hero' }, heroSpeed, heroTok),
       el('div', { class: 'ep-stats' },
         epStat('Memory Used', memLine),
@@ -1460,7 +1484,7 @@ function renderTable(entries) {
       el('td', { class: 'muted mono', title: e.path }, truncMid(e.path)),
       el('td', {}, e.slot || '—'),
       el('td', { class: 'mono' }, String(e.port)),
-      el('td', { class: 'mono' }, e.engine || '—'),
+      el('td', { class: 'mono' }, e.engine ? (e.tp ? `${e.engine} · TP ${e.tp}` : e.engine) : '—'),
       el('td', {}, statusBadge(e.status)),
       el('td', { class: 'acts' },
         startBtn,
@@ -1557,6 +1581,7 @@ function openAdd() {
   $('#f-port').value = '8888';
   $('#f-slot').value = '';
   $('#f-engine').value = 'vllm';
+  $('#f-tp').value = '';
   $('#f-containers').value = '';
   $('#f-procmatch').value = '';
   addOverlay.classList.add('open');
@@ -1576,6 +1601,7 @@ function openEdit(e) {
   $('#f-port').value = e.port != null ? e.port : 8888;
   $('#f-slot').value = e.slot || '';
   $('#f-engine').value = e.engine || 'vllm';
+  $('#f-tp').value = e.tp ? String(e.tp) : '';
   $('#f-containers').value = Array.isArray(e.containers) ? e.containers.join(', ') : '';
   $('#f-procmatch').value = e.process_match || '';
   addOverlay.classList.add('open');
@@ -1597,6 +1623,7 @@ function addFormBody() {
     port: parseInt($('#f-port').value, 10) || 0,
     slot: $('#f-slot').value.trim() || null,
     engine: $('#f-engine').value,
+    tp: $('#f-tp').value ? parseInt($('#f-tp').value, 10) : null,
     containers: $('#f-containers').value.split(',').map((s) => s.trim()).filter(Boolean),
     process_match: $('#f-procmatch').value.trim() || null,
   };
@@ -1881,8 +1908,8 @@ function closeLogs() {
 function renderAll(data) {
   if (!data) return;
   renderTop();
-  renderNodes(data.nodes, data.throttle_baseline_ts);
-  renderThermal(data.nodes);
+  renderNodes(data.nodes, data.throttle_baseline_ts, data.entries);
+  renderThermal(data.nodes, data.entries);
   renderActive(data.entries || []);
   renderTable(data.entries || []);
 }

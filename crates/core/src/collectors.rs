@@ -646,7 +646,7 @@ echo '===GPUAPPS==='; timeout 2 nvidia-smi --query-compute-apps=pid,used_gpu_mem
 echo '===DOCKERPS==='; docker ps --no-trunc --format '{{.ID}}|{{.Names}}' 2>/dev/null; \
 echo '===PROCS==='; for p in $(timeout 2 nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null); do \
 rss=$(grep VmRSS /proc/$p/status 2>/dev/null | awk '{print $2}'); cg=$(tail -1 /proc/$p/cgroup 2>/dev/null); \
-cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-200); echo \"PROC $p ${rss:-0} $cg\"; echo \"CMD $cm\"; done; \
+cm=$(tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-2000); echo \"PROC $p ${rss:-0} $cg\"; echo \"CMD $cm\"; done; \
 echo '===CPUPROCS==='; ps -eo pid=,rss=,args= --no-headers --sort=-rss 2>/dev/null | head -200; \
 echo '===CPUTEMP==='; cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null; \
 echo '===CPUSTAT==='; head -1 /proc/stat; \
@@ -921,6 +921,34 @@ fn entry_fallback_match(e: &RegistryEntry) -> String {
     }
 }
 
+pub fn cmdline_tp(cmdline: &str) -> Option<u8> {
+    let cl = cmdline.to_ascii_lowercase();
+    let parts: Vec<&str> = cl.split_whitespace().collect();
+    for i in 0..parts.len() {
+        let token = parts[i];
+        if let Some(val) = token.strip_prefix("--tp=") {
+            if let Ok(n) = val.parse::<u8>() {
+                return Some(n);
+            }
+        }
+        if let Some(val) = token.strip_prefix("-tp=") {
+            if let Ok(n) = val.parse::<u8>() {
+                return Some(n);
+            }
+        }
+        if (token == "--tp" || token == "-tp" || token == "--tensor-parallel-size") && i + 1 < parts.len() {
+            if let Ok(n) = parts[i + 1].parse::<u8>() {
+                return Some(n);
+            }
+        }
+    }
+    if cl.contains("gb10_inference") {
+        // gb10_inference defaults to single-machine (TP=1) when --tp is omitted
+        return Some(1);
+    }
+    None
+}
+
 fn entry_matches_pid(e: &RegistryEntry, name: Option<&str>, cmdline: &str) -> bool {
     let cl = cmdline.to_ascii_lowercase();
     if let Some(hex) = name {
@@ -930,6 +958,13 @@ fn entry_matches_pid(e: &RegistryEntry, name: Option<&str>, cmdline: &str) -> bo
     }
     if let Some(pm) = &e.process_match {
         if cl.contains(&pm.to_ascii_lowercase()) {
+            if let Some(expected_tp) = e.effective_tp() {
+                if let Some(actual_tp) = cmdline_tp(&cl) {
+                    if expected_tp != actual_tp {
+                        return false;
+                    }
+                }
+            }
             return true;
         }
     }
@@ -1341,5 +1376,54 @@ mod throttle_tests {
         let st = parse_throttle_stat(d).expect("recognised section");
         assert_eq!(st.throttle_sw_power_cap, Some(false));
         assert_eq!(st.sw_power_cap_us, Some(10));
+    }
+
+    #[test]
+    fn test_cmdline_tp_parsing() {
+        assert_eq!(cmdline_tp("./gb10_inference --server --tp 2 --port 8888"), Some(2));
+        assert_eq!(cmdline_tp("./gb10_inference --server --tp=4 --port 8888"), Some(4));
+        assert_eq!(cmdline_tp("./gb10_inference --server --max-batch 4"), Some(1));
+        assert_eq!(cmdline_tp("python -m vllm.entrypoints.openai.api_server --tensor-parallel-size 2"), Some(2));
+        assert_eq!(cmdline_tp("some_other_cmd --unrelated"), None);
+    }
+
+    #[test]
+    fn test_entry_matches_pid_with_tp() {
+        let e_tp1 = RegistryEntry {
+            id: "qwen3.8-flash-tp1".into(),
+            path: "/home/sean/repos/veloGB10".into(),
+            start: "./launch_qwen38_flash_next.sh 1".into(),
+            stop: String::new(),
+            host: "192.168.20.63".into(),
+            port: 8888,
+            slot: "primary-llm".into(),
+            engine: "velogb10".into(),
+            containers: vec![],
+            process_match: Some("gb10_inference".into()),
+            tp: Some(1),
+        };
+        let e_tp2 = RegistryEntry {
+            id: "qwen3.8-flash".into(),
+            path: "/home/sean/repos/veloGB10".into(),
+            start: "./launch_qwen38_flash_next.sh 2".into(),
+            stop: String::new(),
+            host: "192.168.20.63".into(),
+            port: 8888,
+            slot: "primary-llm".into(),
+            engine: "velogb10".into(),
+            containers: vec![],
+            process_match: Some("gb10_inference".into()),
+            tp: Some(2),
+        };
+
+        // TP=1 command line (no --tp flag, gb10_inference)
+        let cmd_tp1 = "./gb10_inference --server --model-dir /path --port 8888";
+        assert!(entry_matches_pid(&e_tp1, None, cmd_tp1));
+        assert!(!entry_matches_pid(&e_tp2, None, cmd_tp1));
+
+        // TP=2 command line (--tp 2)
+        let cmd_tp2 = "./gb10_inference --server --tp 2 --model-dir /path --port 8888";
+        assert!(!entry_matches_pid(&e_tp1, None, cmd_tp2));
+        assert!(entry_matches_pid(&e_tp2, None, cmd_tp2));
     }
 }

@@ -532,6 +532,7 @@ mod tests {
             engine: "vllm".into(),
             containers: vec![],
             process_match: None,
+            tp: None,
         }
     }
 

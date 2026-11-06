@@ -343,6 +343,7 @@ async fn probe_tensorfold(
         ok: true,
         detail: None,
         served_model: served,
+        tp: e.effective_tp(),
         concurrent,
         queued,
         live_tok_per_sec: live,
@@ -457,6 +458,7 @@ pub async fn probe_vllm(e: &RegistryEntry, url: &str, prev: &mut Prev, client: &
             Some("stats disabled; liveness via /v1/models".into())
         },
         served_model: served,
+        tp: e.effective_tp(),
         concurrent,
         queued,
         live_tok_per_sec: live,
@@ -555,6 +557,23 @@ async fn probe_velogb10(
         return fail_probe("status != ok".into());
     }
 
+    let detected_tp: Option<u8> = v
+        .get("telemetry")
+        .and_then(|t| t.get("tp_width"))
+        .and_then(|w| w.as_u64())
+        .map(|w| if w == 0 { 1 } else { w as u8 });
+
+    if let Some(expected_tp) = e.effective_tp() {
+        if let Some(detected) = detected_tp {
+            if expected_tp != detected {
+                return fail_probe(format!(
+                    "serving '{}' (TP {detected} != expected {expected_tp})",
+                    served.as_deref().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
+
     // Metrics are best-effort (may be disabled); only trust a 2xx body. The
     // /health emission counters below read 0 when the server runs
     // mode:"none" (no speculation), so /metrics is the source of truth for
@@ -611,6 +630,7 @@ async fn probe_velogb10(
             Some("stats disabled; liveness via /health".into())
         },
         served_model: served,
+        tp: detected_tp,
         concurrent: prom_concurrent,
         queued: prom_queued,
         live_tok_per_sec: live,
@@ -665,6 +685,7 @@ mod tests {
             engine: "tensorfold".into(),
             containers: vec![],
             process_match: None,
+            tp: None,
         }
     }
 
@@ -716,6 +737,21 @@ mod tests {
         );
         let models = vec!["GLM-5.3-Flash-EXL3".to_string()];
         assert!(!model_matches_entry(&e, &models));
+    }
+
+    #[test]
+    fn test_effective_tp_inference() {
+        let mut e = make_entry("qwen3.8-flash", "/home/sean/repos/veloGB10", 8888);
+        e.start = "./launch_qwen38_flash_next.sh 2".into();
+        assert_eq!(e.effective_tp(), Some(2));
+
+        let mut e1 = make_entry("qwen3.8-flash-tp1", "/home/sean/repos/veloGB10", 8888);
+        e1.start = "./launch_qwen38_flash_next.sh 1".into();
+        assert_eq!(e1.effective_tp(), Some(1));
+
+        let mut e_explicit = make_entry("custom-model", "/path", 8888);
+        e_explicit.tp = Some(4);
+        assert_eq!(e_explicit.effective_tp(), Some(4));
     }
 
     #[test]
