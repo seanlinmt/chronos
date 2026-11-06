@@ -22,6 +22,7 @@ use chronos_embed::{env_num, env_or, invalid_request, server_error, ApiError, MA
 use fastembed::{Bgem3Embedding, Bgem3InitOptions, Bgem3Model};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 /// Hard cap on texts per request.
 const MAX_BATCH: usize = 256;
@@ -34,6 +35,15 @@ const DEFAULT_MODEL_CACHE: &str = "/mnt/nvmeof/fastembed-cache";
 const DEFAULT_MAX_LEN: usize = 8192;
 const DEFAULT_THREADS: usize = 8;
 const DEFAULT_MODEL_NAME: &str = "bge-m3";
+
+/// Max ONNX calls executing at once (see `AppState::inflight`). The model
+/// mutex already serializes inference, so 1 is the whole point: queued
+/// requests park on the semaphore instead of holding blocking threads.
+const INFLIGHT_PERMITS: usize = 1;
+/// Default tokio pool sizes, overridable via `TOKIO_WORKER_THREADS` /
+/// `TOKIO_MAX_BLOCKING_THREADS` (pinned by the systemd unit).
+const DEFAULT_TOKIO_WORKERS: usize = 2;
+const DEFAULT_TOKIO_BLOCKING: usize = 4;
 
 struct Config {
     port: u16,
@@ -62,6 +72,13 @@ struct AppState {
     /// The guard is only ever held inside `spawn_blocking`, never across an
     /// `.await`.
     model: Arc<Mutex<Bgem3Embedding>>,
+    /// Admission gate to the blocking pool. Without it every concurrent
+    /// request spawned its own `spawn_blocking` thread that then just blocked
+    /// on the model mutex, and tokio kept those threads alive after the
+    /// burst — this grew the process from 28 to 48 OS threads over 13 days of
+    /// uptime. With it, the thread count stays flat: extra requests await the
+    /// permit cheaply on the async side.
+    inflight: Arc<Semaphore>,
     model_name: String,
 }
 
@@ -147,8 +164,16 @@ async fn embeddings(
     let texts = extract_texts(req.input)?;
     let model_name = state.model_name.clone();
     let model = state.model.clone();
+    let inflight = state.inflight.clone();
+
+    // One ONNX call executing at a time (see `AppState::inflight`).
+    let _permit = inflight
+        .acquire_owned()
+        .await
+        .map_err(|_| server_error("embedding semaphore closed"))?;
 
     let dense = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, String> {
+        let _permit = _permit; // held for the duration of the ONNX call
         let mut guard = match model.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -196,8 +221,25 @@ async fn embeddings(
     })))
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `#[tokio::main]` defaults to one worker per core (20 on GB10) plus a
+    // blocking pool that grows toward 512 threads, each kept alive ~10 s past
+    // its last task — that silently added 20+ OS threads during concurrent
+    // bursts. Pin both pools: past `max_blocking_threads` blocking tasks
+    // *queue* instead of spawning threads, which is exactly the backpressure
+    // a mutex-serialized ONNX server wants.
+    let workers = env_num::<usize>("TOKIO_WORKER_THREADS", DEFAULT_TOKIO_WORKERS).max(1);
+    let blocking = env_num::<usize>("TOKIO_MAX_BLOCKING_THREADS", DEFAULT_TOKIO_BLOCKING).max(1);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(blocking)
+        .thread_name("chronos-embed")
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env();
     println!(
         "[chronos-embed] config: port={} model_name={} cache={} max_len={} threads={}",
@@ -240,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state = Arc::new(AppState {
         model: Arc::new(Mutex::new(model)),
+        inflight: Arc::new(Semaphore::new(INFLIGHT_PERMITS)),
         model_name: cfg.model_name,
     });
 
